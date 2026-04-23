@@ -14,6 +14,8 @@ from river.metrics.base import ClassificationMetric, Metric, RegressionMetric
 from river.tree import HoeffdingTreeClassifier, HoeffdingTreeRegressor
 from river.utils.random import poisson
 
+from river import cluster
+
 
 class BaseSRPEnsemble(base.Wrapper, base.Ensemble):
     """Base class for the sRP ensemble family"""
@@ -32,18 +34,18 @@ class BaseSRPEnsemble(base.Wrapper, base.Ensemble):
     }
 
     def __init__(
-        self,
-        model: base.Estimator | None = None,
-        n_models: int = 100,
-        subspace_size: int | float | str = 0.6,
-        training_method: str = "patches",
-        lam: float = 6.0,
-        drift_detector: base.DriftDetector | None = None,
-        warning_detector: base.DriftDetector | None = None,
-        disable_detector: str = "off",
-        disable_weighted_vote: bool = False,
-        seed: int | None = None,
-        metric: Metric | None = None,
+            self,
+            model: base.Estimator | None = None,
+            n_models: int = 100,
+            subspace_size: int | float | str = 0.6,
+            training_method: str = "patches",
+            lam: float = 6.0,
+            drift_detector: base.DriftDetector | None = None,
+            warning_detector: base.DriftDetector | None = None,
+            disable_detector: str = "off",
+            disable_weighted_vote: bool = False,
+            seed: int | None = None,
+            metric: Metric | None = None,
     ):
         # List of models is properly initialized later
         super().__init__([])  # type: ignore
@@ -162,7 +164,7 @@ class BaseSRPEnsemble(base.Wrapper, base.Ensemble):
                     # feature combinations of size k
                     self._subspaces = []
                     for i, combination in enumerate(
-                        itertools.cycle(itertools.combinations(features, k))
+                            itertools.cycle(itertools.combinations(features, k))
                     ):
                         if i == self.n_models:
                             break
@@ -187,8 +189,8 @@ class BaseSRPEnsemble(base.Wrapper, base.Ensemble):
             range(self.n_models)
         )  # For matching subspaces with ensemble members
         if (
-            self.training_method == self._TRAIN_RANDOM_PATCHES
-            or self.training_method == self._TRAIN_RANDOM_SUBSPACES
+                self.training_method == self._TRAIN_RANDOM_PATCHES
+                or self.training_method == self._TRAIN_RANDOM_SUBSPACES
         ):
             # Shuffle indexes
             self._rng.shuffle(subspace_indexes)
@@ -221,16 +223,16 @@ class BaseSRPEstimator:
     """Base class for estimators (classifiers or regressors) in SRP"""
 
     def __init__(
-        self,
-        idx_original: int,
-        model: base.Estimator,
-        metric: Metric,
-        created_on: int,
-        drift_detector: base.DriftDetector,
-        warning_detector: base.DriftDetector,
-        is_background_learner,
-        rng: random.Random,
-        features=None,
+            self,
+            idx_original: int,
+            model: base.Estimator,
+            metric: Metric,
+            created_on: int,
+            drift_detector: base.DriftDetector,
+            warning_detector: base.DriftDetector,
+            is_background_learner,
+            rng: random.Random,
+            features=None,
     ):
         self.idx_original = idx_original
         self.created_on = created_on
@@ -383,6 +385,9 @@ class SRPClassifier(BaseSRPEnsemble, base.Classifier):
         The metric to track members performance within the ensemble. This
         implementation assumes that larger values are better when using
         weighted votes.
+    n_clusters
+        The number of clusters to use for local drift detection. If set to 0,
+        no clustering is performed and drift detection is global.
 
     Examples
     --------
@@ -427,18 +432,19 @@ class SRPClassifier(BaseSRPEnsemble, base.Classifier):
     """
 
     def __init__(
-        self,
-        model: base.Estimator | None = None,
-        n_models: int = 10,
-        subspace_size: int | float | str = 0.6,
-        training_method: str = "patches",
-        lam: int = 6,
-        drift_detector: base.DriftDetector | None = None,
-        warning_detector: base.DriftDetector | None = None,
-        disable_detector: str = "off",
-        disable_weighted_vote: bool = False,
-        seed: int | None = None,
-        metric: ClassificationMetric | None = None,
+            self,
+            model: base.Estimator | None = None,
+            n_models: int = 10,
+            subspace_size: int | float | str = 0.6,
+            training_method: str = "patches",
+            lam: int = 6,
+            drift_detector: base.DriftDetector | None = None,
+            warning_detector: base.DriftDetector | None = None,
+            disable_detector: str = "off",
+            disable_weighted_vote: bool = False,
+            seed: int | None = None,
+            metric: ClassificationMetric | None = None,
+            n_clusters: int = 5,  # Configurable cluster count
     ):
         if model is None:
             model = HoeffdingTreeClassifier(grace_period=50, delta=0.01)
@@ -481,6 +487,36 @@ class SRPClassifier(BaseSRPEnsemble, base.Classifier):
 
         self._base_learner_class = BaseSRPClassifier  # type: ignore
 
+        self.clusterer = cluster.Kmeans(n_clusters=n_clusters, seed=seed) if n_clusters > 0 else None
+        self.observed_classes = set()  # To track observed classes for clustering
+
+    def learn_one(self, x: dict, y: base.typing.Target, **kwargs):
+        self._n_samples_seen += 1
+        self.observed_classes.add(y)
+
+        if not self:
+            self._init_ensemble(list(x.keys()))
+
+        # Update clusterer and get the active region
+        self.clusterer.learn_one(x)
+        cluster_id = self.clusterer.predict_one(x)
+
+        for model in self:
+            # Test-then-train: Score the model on this specific cluster before training
+            y_pred = model.predict_one(x)
+            if y_pred is not None:
+                # We update the cluster-specific metric, not the global one
+                model.cluster_metrics[cluster_id].update(y_true=y, y_pred=y_pred)
+
+            # Train the model (pass the cluster_id down)
+            if self.training_method == self._TRAIN_RANDOM_SUBSPACES:
+                k = 1
+            else:
+                k = poisson(rate=self.lam, rng=self._rng)
+                if k == 0:
+                    continue
+            model.learn_one(x=x, y=y, w=k, n_samples_seen=self._n_samples_seen, cluster_id=cluster_id)
+
     def predict_proba_one(self, x, **kwargs):
         y_pred = collections.Counter()
 
@@ -488,11 +524,29 @@ class SRPClassifier(BaseSRPEnsemble, base.Classifier):
             self._init_ensemble(features=list(x.keys()))
             return y_pred
 
+        # Find which cluster this instance belongs to
+        cluster_id = self.clusterer.predict_one(x)
+
+        # Calculate the Better-than-Random threshold
+        num_classes = len(self.observed_classes)
+        threshold = 1.0 / num_classes if num_classes > 1 else 0.0
+
+        # Dynamic Ensemble Selection (Soft Deactivation)
         for model in self.models:
             y_proba_temp = model.predict_proba_one(x, **kwargs)
-            metric_value = model.metric.get()
-            if not self.disable_weighted_vote and metric_value > 0.0:
-                y_proba_temp = {k: val * metric_value for k, val in y_proba_temp.items()}
+
+            # metric_value = model.metric.get()
+
+            # Get the model's accuracy specifically for this cluster
+            cluster_accuracy = model.cluster_metrics[cluster_id].get()
+
+            if not self.disable_weighted_vote:  # and metric_value > 0.0:
+                # The C-DES Rule: If worse than random, weight is 0 (deactivated)
+                weight = cluster_accuracy if cluster_accuracy > threshold else 0.0
+
+                # y_proba_temp = {k: val * metric_value for k, val in y_proba_temp.items()}
+                y_proba_temp = {k: val * weight for k, val in y_proba_temp.items()}
+
             y_pred.update(y_proba_temp)
 
         total = sum(y_pred.values())
@@ -505,16 +559,16 @@ class BaseSRPClassifier(BaseSRPEstimator):
     """Class representing the base learner of SRPClassifier."""
 
     def __init__(
-        self,
-        idx_original: int,
-        model: base.Classifier,
-        metric: ClassificationMetric,
-        created_on: int,
-        drift_detector: base.DriftDetector,
-        warning_detector: base.DriftDetector,
-        is_background_learner,
-        rng: random.Random,
-        features=None,
+            self,
+            idx_original: int,
+            model: base.Classifier,
+            metric: ClassificationMetric,
+            created_on: int,
+            drift_detector: base.DriftDetector,
+            warning_detector: base.DriftDetector,
+            is_background_learner,
+            rng: random.Random,
+            features=None,
     ):
         super().__init__(
             idx_original=idx_original,
@@ -528,14 +582,25 @@ class BaseSRPClassifier(BaseSRPEstimator):
             features=features,
         )
 
+        # Default dictionary so new clusters automatically start with a fresh metric
+        self.cluster_metrics = collections.defaultdict(lambda: metric.clone())
+
+        self.is_batch_detector = hasattr(self.drift_detector, "process_batch")
+
+        if self.is_batch_detector:
+            self._x_buffer = []
+            self._y_buffer = []
+            self.p_size = getattr(self.drift_detector, "p_size", 500)
+
     def learn_one(
-        self,
-        x: dict,
-        y: base.typing.ClfTarget,
-        *,
-        w: int,
-        n_samples_seen: int,
-        **kwargs,
+            self,
+            x: dict,
+            y: base.typing.ClfTarget,
+            *,
+            w: int,
+            n_samples_seen: int,
+            cluster_id: int = None,
+            **kwargs,
     ):
         if self.features is not None:
             # Select the subset of features to use
@@ -544,7 +609,6 @@ class BaseSRPClassifier(BaseSRPEstimator):
             # Use all features
             x_subset = x
 
-        # TODO Find a way to verify if the model natively supports sample_weight (w)
         for _ in range(int(w)):
             self.model.learn_one(x=x_subset, y=y, **kwargs)  # type: ignore[attr-defined]
 
@@ -557,6 +621,7 @@ class BaseSRPClassifier(BaseSRPEstimator):
                 y=y,  # type: ignore[arg-type]
                 w=w,
                 n_samples_seen=n_samples_seen,  # type: ignore
+                cluster_id=cluster_id  # Pass cluster_id down
             )
 
         if not self.disable_drift_detector and not self.is_background_learner:
@@ -573,13 +638,20 @@ class BaseSRPClassifier(BaseSRPEstimator):
 
             # ===== Drift detection =====
             # Update the drift detection method
+            # TODO: make change for SDDM
             self.drift_detector.update(int(not correctly_classifies))
             # Check if there was a change
             if self.drift_detector.drift_detected:
-                all_features = list(x.keys())
                 self.n_drifts_detected += 1
-                # There was a change, reset the model
-                self.reset(all_features=all_features, n_samples_seen=n_samples_seen)
+
+                # all_features = list(x.keys())
+                # # There was a change, reset the model
+                # self.reset(all_features=all_features, n_samples_seen=n_samples_seen)
+
+                if cluster_id is not None:
+                    # We do NOT call self.reset(). We keep the tree but zero its competence.
+                    # This forces it to re-earn its voting rights in this specific region.
+                    self.cluster_metrics[cluster_id] = self.metric.clone()
 
     def predict_proba_one(self, x, **kwargs):
         # Select the features to use
@@ -706,20 +778,20 @@ class SRPRegressor(BaseSRPEnsemble, base.Regressor):
     _PREDICTION = "prediction"
 
     def __init__(
-        self,
-        model: base.Regressor | None = None,
-        n_models: int = 10,
-        subspace_size: int | float | str = 0.6,
-        training_method: str = "patches",
-        lam: int = 6,
-        drift_detector: base.DriftDetector | None = None,
-        warning_detector: base.DriftDetector | None = None,
-        disable_detector: str = "off",
-        disable_weighted_vote: bool = True,
-        drift_detection_criteria: str = "error",
-        aggregation_method: str = "mean",
-        seed=None,
-        metric: RegressionMetric | None = None,
+            self,
+            model: base.Regressor | None = None,
+            n_models: int = 10,
+            subspace_size: int | float | str = 0.6,
+            training_method: str = "patches",
+            lam: int = 6,
+            drift_detector: base.DriftDetector | None = None,
+            warning_detector: base.DriftDetector | None = None,
+            disable_detector: str = "off",
+            disable_weighted_vote: bool = True,
+            drift_detection_criteria: str = "error",
+            aggregation_method: str = "mean",
+            seed=None,
+            metric: RegressionMetric | None = None,
     ):
         # Check arguments for parent class
         if model is None:
@@ -804,17 +876,17 @@ class BaseSRPRegressor(BaseSRPEstimator):
     """Class representing the base learner of SRPClassifier."""
 
     def __init__(
-        self,
-        idx_original: int,
-        model: base.Regressor,
-        metric: RegressionMetric,
-        created_on: int,
-        drift_detector: base.DriftDetector,
-        warning_detector: base.DriftDetector,
-        is_background_learner,
-        rng: random.Random,
-        features=None,
-        drift_detection_criteria: str | None = None,
+            self,
+            idx_original: int,
+            model: base.Regressor,
+            metric: RegressionMetric,
+            created_on: int,
+            drift_detector: base.DriftDetector,
+            warning_detector: base.DriftDetector,
+            is_background_learner,
+            rng: random.Random,
+            features=None,
+            drift_detection_criteria: str | None = None,
     ):
         super().__init__(
             idx_original=idx_original,
@@ -830,13 +902,13 @@ class BaseSRPRegressor(BaseSRPEstimator):
         self.drift_detection_criteria = drift_detection_criteria
 
     def learn_one(
-        self,
-        x: dict,
-        y: base.typing.RegTarget,
-        *,
-        w: int,
-        n_samples_seen: int,
-        **kwargs,
+            self,
+            x: dict,
+            y: base.typing.RegTarget,
+            *,
+            w: int,
+            n_samples_seen: int,
+            **kwargs,
     ):
         all_features = list(x.keys())
         if self.features is not None:
