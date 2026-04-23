@@ -487,7 +487,7 @@ class SRPClassifier(BaseSRPEnsemble, base.Classifier):
 
         self._base_learner_class = BaseSRPClassifier  # type: ignore
 
-        self.clusterer = cluster.Kmeans(n_clusters=n_clusters, seed=seed) if n_clusters > 0 else None
+        self.clusterer = cluster.KMeans(n_clusters=n_clusters, seed=seed) if n_clusters > 0 else None
         self.observed_classes = set()  # To track observed classes for clustering
 
     def learn_one(self, x: dict, y: base.typing.Target, **kwargs):
