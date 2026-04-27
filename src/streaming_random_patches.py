@@ -976,37 +976,24 @@ class BaseSRPClassifierSDDM(BaseSRPEstimator):
         model: base.Classifier,
         metric,
         created_on: int,
-        drift_detector,   # NIE używamy globalnie
-        warning_detector,
         is_background_learner,
         rng,
         features=None,
-        sddm_constructor=None,   # <-- NOWE
     ):
+        # Usuwamy drift_detector, warning_detector, zostawiamy None tak jak było
         super().__init__(
             idx_original=idx_original,
             model=model,
             metric=metric,
             created_on=created_on,
-            drift_detector=None,  # WYŁĄCZAMY globalny detector
+            drift_detector=None,  
             warning_detector=None,
             is_background_learner=is_background_learner,
             rng=rng,
             features=features,
         )
-
         self.cluster_metrics = collections.defaultdict(lambda: metric.clone())
-
-        # 🔥 KLUCZ: osobny SDDM per cluster
-        self.cluster_detectors = {}
-
-        # fabryka detectorów
-        self.sddm_constructor = sddm_constructor
-
-    def _get_detector(self, cluster_id):
-        if cluster_id not in self.cluster_detectors:
-            self.cluster_detectors[cluster_id] = self.sddm_constructor()
-        return self.cluster_detectors[cluster_id]
+        self.t = 0
 
     def learn_one(
         self,
@@ -1018,6 +1005,7 @@ class BaseSRPClassifierSDDM(BaseSRPEstimator):
         cluster_id: int = None,
         **kwargs,
     ):
+        self.t += 1
         # --- subspace ---
         if self.features is not None:
             x_subset = {k: x[k] for k in self.features if k in x}
@@ -1028,7 +1016,7 @@ class BaseSRPClassifierSDDM(BaseSRPEstimator):
         for _ in range(int(w)):
             self.model.learn_one(x=x_subset, y=y)
 
-        # --- background learner (bez zmian) ---
+        # --- background learner ---
         if self._background_learner:
             self._background_learner.learn_one(
                 x=x,
@@ -1038,18 +1026,7 @@ class BaseSRPClassifierSDDM(BaseSRPEstimator):
                 cluster_id=cluster_id
             )
 
-        # --- SDDM per cluster ---
-        if cluster_id is not None:
-            detector = self._get_detector(cluster_id)
-
-            detector.update(x, y)  
-
-            if detector.drift_detected:
-                self.n_drifts_detected += 1
-
-                # identyczna logika jak wcześniej:
-                # NIE resetujemy modelu, tylko zerujemy competence
-                self.cluster_metrics[cluster_id] = self.metric.clone()
+        # Logika SDDM została stąd USUNIĘTA
 
     def predict_proba_one(self, x):
         if self.features is not None:
@@ -1064,8 +1041,7 @@ class BaseSRPClassifierSDDM(BaseSRPEstimator):
         if y_proba:
             return max(y_proba, key=y_proba.get)
         return None
-
-
+    
 class SRPClassifierSDDM(BaseSRPEnsemble, base.Classifier):
 
     def __init__(
@@ -1078,7 +1054,8 @@ class SRPClassifierSDDM(BaseSRPEnsemble, base.Classifier):
         seed=None,
         metric=None,
         n_clusters=5,
-        sddm_constructor=None,   
+        sddm_constructor=None,
+        printer=True, # Dodajemy flagę printer tutaj
     ):
         if model is None:
             model = HoeffdingTreeClassifier(grace_period=50, delta=0.01)
@@ -1104,7 +1081,15 @@ class SRPClassifierSDDM(BaseSRPEnsemble, base.Classifier):
         self.clusterer = cluster.KMeans(n_clusters=n_clusters, seed=seed)
         self.observed_classes = set()
 
+        # Konstruktor detektora na poziomie zespołu
         self.sddm_constructor = sddm_constructor
+        self.cluster_detectors = {}
+        self.printer = printer
+
+    def _get_detector(self, cluster_id):
+        if cluster_id not in self.cluster_detectors:
+            self.cluster_detectors[cluster_id] = self.sddm_constructor()
+        return self.cluster_detectors[cluster_id]
 
     def _init_ensemble(self, features):
         self._generate_subspaces(features)
@@ -1113,21 +1098,18 @@ class SRPClassifierSDDM(BaseSRPEnsemble, base.Classifier):
 
         for i in range(self.n_models):
             subspace = self._subspaces[subspace_indexes[i]]
-
             self.append(
                 self._base_learner_class(
                     idx_original=i,
                     model=self.model,
                     metric=self.metric,
                     created_on=self._n_samples_seen,
-                    drift_detector=None,
-                    warning_detector=None,
                     is_background_learner=False,
                     rng=self._rng,
                     features=subspace,
-                    sddm_constructor=self.sddm_constructor,  
                 )
             )
+
     def learn_one(self, x, y):
         self._n_samples_seen += 1
         self.observed_classes.add(y)
@@ -1139,17 +1121,34 @@ class SRPClassifierSDDM(BaseSRPEnsemble, base.Classifier):
         self.clusterer.learn_one(x)
         cluster_id = self.clusterer.predict_one(x)
 
+        # --- 1. GLOBALNY SDDM DLA AKTUALNEGO KLASTRA ---
+        detector = self._get_detector(cluster_id)
+        detector.update(x, y)
+        
+        # Flaga RiverSDDM (_drift_detected) określa, czy w tej iteracji padł dryf
+        drift_in_cluster = detector._drift_detected
+
+        if drift_in_cluster and self.printer:
+            r = detector.get_drift_report()
+            print(f"[DRIFT ENSEMBLE] Instance: {self._n_samples_seen} | Cluster: {cluster_id} | Feature: {r['source']} | Mag: {r['magnitude']:.4f}")
+        # --- 2. TEST-THEN-TRAIN NA MODELACH BAZOWYCH ---
         for model in self.models:
-            # --- predict ---
+            # A. RESET KOMPETENCJI: Jeśli cały zespół wie, że klaster ma dryf, 
+            # wyzeruj kompetencje w tym regionie zanim przewidzisz (model musi pracować od nowa)
+            if drift_in_cluster:
+                model.cluster_metrics[cluster_id] = self.metric.clone()
+
+            # B. TEST
             y_pred = model.predict_one(x)
             if y_pred is not None:
                 model.cluster_metrics[cluster_id].update(y, y_pred)
 
-            # --- bagging ---
+            # C. BAGGING
             k = poisson(rate=self.lam, rng=self._rng)
             if k == 0:
                 continue
 
+            # D. TRAIN
             model.learn_one(
                 x=x,
                 y=y,
@@ -1158,7 +1157,7 @@ class SRPClassifierSDDM(BaseSRPEnsemble, base.Classifier):
                 cluster_id=cluster_id,
             )
 
-    # --- PREDICT ---
+    # --- Metody predict_proba_one i predict_one pozostają bez zmian! ---
     def predict_proba_one(self, x):
         y_pred = collections.Counter()
 

@@ -13,7 +13,7 @@ class RiverSDDM(base.DriftDetector):
         threshold=0.6,
         alpha=1.0,
         incremental=True,
-        printer = True
+        printer = False
     ):
         super().__init__()
         self.n_classes = n_classes
@@ -106,21 +106,27 @@ class RiverSDDM(base.DriftDetector):
         self.t += 1
         self._drift_detected = False
 
-        # --- FAZA 1: Zbieranie granic (Warm-up) ---
+        # --- FAZA 1: Zbieranie granic (Warm-up / Re-scaling) ---
         if not self._limits_set:
-            # Aktualizuj globalne min/max
+            # Aktualizuj globalne min/max dla nowych danych
             for name, val in x.items():
                 if val < self._mins[name]: self._mins[name] = val
                 if val > self._maxs[name]: self._maxs[name] = val
             
             self.ref_window.append((x, y))
             
-            # Jeśli zebraliśmy wystarczająco danych w oknie referencyjnym, "zamrażamy" granice
+            # Czekamy na zapełnienie okna referencyjnego, aby "zamrozić" nowe granice
             if len(self.ref_window) >= self.ref_window_size:
-                # Wypełnij histogram referencyjny danymi z kolejki na podstawie nowych granic
+                # Wypełnij histogram referencyjny na podstawie nowo zebranych granic
+                self.ref_XY.fill(0) # Upewniamy się, że jest czysty
                 for old_x, old_y in self.ref_window:
                     self._update_hist(old_x, old_y, self.ref_XY, add=True)
                 self._limits_set = True
+                
+                # Ważne: czyścimy okno bieżące, aby zaczęło zbierać dane od zera po warm-upie
+                self.cur_window.clear()
+                self.cur_XY.fill(0)
+                
             return self
 
         # --- FAZA 2: Normalne działanie (Sliding Window) ---
@@ -130,6 +136,7 @@ class RiverSDDM(base.DriftDetector):
             passed_x, passed_y = self.cur_window.popleft()
             self._update_hist(passed_x, passed_y, self.cur_XY, add=False)
 
+            # Przesunięcie najstarszej próbki z bieżącego do referencyjnego
             if not self.incremental:
                 if len(self.ref_window) >= self.ref_window_size:
                     old_ref_x, old_ref_y = self.ref_window.popleft()
@@ -141,10 +148,16 @@ class RiverSDDM(base.DriftDetector):
         self.cur_window.append((x, y))
         self._update_hist(x, y, self.cur_XY, add=True)
 
-        # Testowanie dryfu
-        if self.t % self.test_interval == 0 and len(self.ref_window) >= self.ref_window_size:
+        # Testowanie dryfu: 
+        # Dodany warunek: len(self.cur_window) >= self.cur_window.maxlen
+        # Gwarantuje to, że oba okna są pełne przed obliczeniem KL Divergence
+        if (self.t % self.test_interval == 0 and 
+            len(self.ref_window) >= self.ref_window_size and 
+            len(self.cur_window) >= self.cur_window.maxlen):
+            
             drifts = []
             for f in range(self.n_features):
+                # Używamy spłaszczonych rozkładów (Feature x Class)
                 p = self.cur_XY[f].flatten()
                 q = self.ref_XY[f].flatten()
                 drifts.append(self._kl_divergence(p, q))
@@ -155,20 +168,24 @@ class RiverSDDM(base.DriftDetector):
             if self._drift_mag > self.threshold:
                 self._drift_detected = True
                 self._source_feature = self.feature_names[np.argmax(drifts)]
+                
                 if self.printer:
                     r = self.get_drift_report()
-                    print(self.t,"source:",r["source"],"magnitude", r["magnitude"])
-                # Reset i przesunięcie okien (jak w oryginale)
-                self.ref_window.clear()
-                self.ref_XY.fill(0)
-                
-                temp_cur = list(self.cur_window)
-                self.cur_window.clear()
-                self.cur_XY.fill(0)
+                    print(f" [DRIFT @ {self.t}] Feature: {r['source']} | Mag: {r['magnitude']}")
 
-                for val_x, val_y in temp_cur:
-                    self.ref_window.append((val_x, val_y))
-                    self._update_hist(val_x, val_y, self.ref_XY, add=True)
+                # --- POWRÓT DO FAZY 1 ---
+                self._limits_set = False 
+                
+                # Resetowanie struktur
+                self.ref_window.clear()
+                self.cur_window.clear()
+                self.ref_XY.fill(0)
+                self.cur_XY.fill(0)
+                
+                # Resetowanie granic min/max dla ponownego skalowania
+                for name in self.feature_names:
+                    self._mins[name] = float('inf')
+                    self._maxs[name] = float('-inf')
                 
         return self
     
