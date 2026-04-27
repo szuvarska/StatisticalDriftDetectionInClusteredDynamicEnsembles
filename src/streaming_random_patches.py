@@ -966,3 +966,227 @@ class BaseSRPRegressor(BaseSRPEstimator):
         x_subset = {k: x[k] for k in self.features if k in x} if self.features is not None else x
 
         return self.model.predict_one(x_subset, **kwargs)
+
+
+class BaseSRPClassifierSDDM(BaseSRPEstimator):
+
+    def __init__(
+        self,
+        idx_original: int,
+        model: base.Classifier,
+        metric,
+        created_on: int,
+        drift_detector,   # NIE używamy globalnie
+        warning_detector,
+        is_background_learner,
+        rng,
+        features=None,
+        sddm_constructor=None,   # <-- NOWE
+    ):
+        super().__init__(
+            idx_original=idx_original,
+            model=model,
+            metric=metric,
+            created_on=created_on,
+            drift_detector=None,  # WYŁĄCZAMY globalny detector
+            warning_detector=None,
+            is_background_learner=is_background_learner,
+            rng=rng,
+            features=features,
+        )
+
+        self.cluster_metrics = collections.defaultdict(lambda: metric.clone())
+
+        # 🔥 KLUCZ: osobny SDDM per cluster
+        self.cluster_detectors = {}
+
+        # fabryka detectorów
+        self.sddm_constructor = sddm_constructor
+
+    def _get_detector(self, cluster_id):
+        if cluster_id not in self.cluster_detectors:
+            self.cluster_detectors[cluster_id] = self.sddm_constructor()
+        return self.cluster_detectors[cluster_id]
+
+    def learn_one(
+        self,
+        x: dict,
+        y,
+        *,
+        w: int,
+        n_samples_seen: int,
+        cluster_id: int = None,
+        **kwargs,
+    ):
+        # --- subspace ---
+        if self.features is not None:
+            x_subset = {k: x[k] for k in self.features if k in x}
+        else:
+            x_subset = x
+
+        # --- trening ---
+        for _ in range(int(w)):
+            self.model.learn_one(x=x_subset, y=y)
+
+        # --- background learner (bez zmian) ---
+        if self._background_learner:
+            self._background_learner.learn_one(
+                x=x,
+                y=y,
+                w=w,
+                n_samples_seen=n_samples_seen,
+                cluster_id=cluster_id
+            )
+
+        # --- SDDM per cluster ---
+        if cluster_id is not None:
+            detector = self._get_detector(cluster_id)
+
+            detector.update(x, y)  
+
+            if detector.drift_detected:
+                self.n_drifts_detected += 1
+
+                # identyczna logika jak wcześniej:
+                # NIE resetujemy modelu, tylko zerujemy competence
+                self.cluster_metrics[cluster_id] = self.metric.clone()
+
+    def predict_proba_one(self, x):
+        if self.features is not None:
+            x_subset = {k: x[k] for k in self.features if k in x}
+        else:
+            x_subset = x
+
+        return self.model.predict_proba_one(x_subset)
+
+    def predict_one(self, x):
+        y_proba = self.predict_proba_one(x)
+        if y_proba:
+            return max(y_proba, key=y_proba.get)
+        return None
+
+
+class SRPClassifierSDDM(BaseSRPEnsemble, base.Classifier):
+
+    def __init__(
+        self,
+        model=None,
+        n_models=10,
+        subspace_size=0.6,
+        training_method="patches",
+        lam=6,
+        seed=None,
+        metric=None,
+        n_clusters=5,
+        sddm_constructor=None,   
+    ):
+        if model is None:
+            model = HoeffdingTreeClassifier(grace_period=50, delta=0.01)
+
+        if metric is None:
+            metric = Accuracy()
+
+        super().__init__(
+            model=model,
+            n_models=n_models,
+            subspace_size=subspace_size,
+            training_method=training_method,
+            lam=lam,
+            drift_detector=None,        # WYŁĄCZONE
+            warning_detector=None,
+            disable_detector="drift",
+            seed=seed,
+            metric=metric,
+        )
+
+        self._base_learner_class = BaseSRPClassifierSDDM
+
+        self.clusterer = cluster.KMeans(n_clusters=n_clusters, seed=seed)
+        self.observed_classes = set()
+
+        self.sddm_constructor = sddm_constructor
+
+    def _init_ensemble(self, features):
+        self._generate_subspaces(features)
+        subspace_indexes = list(range(self.n_models))
+        self._rng.shuffle(subspace_indexes)
+
+        for i in range(self.n_models):
+            subspace = self._subspaces[subspace_indexes[i]]
+
+            self.append(
+                self._base_learner_class(
+                    idx_original=i,
+                    model=self.model,
+                    metric=self.metric,
+                    created_on=self._n_samples_seen,
+                    drift_detector=None,
+                    warning_detector=None,
+                    is_background_learner=False,
+                    rng=self._rng,
+                    features=subspace,
+                    sddm_constructor=self.sddm_constructor,  
+                )
+            )
+    def learn_one(self, x, y):
+        self._n_samples_seen += 1
+        self.observed_classes.add(y)
+
+        if not self.models:
+            self._init_ensemble(list(x.keys()))
+
+        # cluster update
+        self.clusterer.learn_one(x)
+        cluster_id = self.clusterer.predict_one(x)
+
+        for model in self.models:
+            # --- predict ---
+            y_pred = model.predict_one(x)
+            if y_pred is not None:
+                model.cluster_metrics[cluster_id].update(y, y_pred)
+
+            # --- bagging ---
+            k = poisson(rate=self.lam, rng=self._rng)
+            if k == 0:
+                continue
+
+            model.learn_one(
+                x=x,
+                y=y,
+                w=k,
+                n_samples_seen=self._n_samples_seen,
+                cluster_id=cluster_id,
+            )
+
+    # --- PREDICT ---
+    def predict_proba_one(self, x):
+        y_pred = collections.Counter()
+
+        if not self.models:
+            self._init_ensemble(list(x.keys()))
+            return y_pred
+
+        cluster_id = self.clusterer.predict_one(x)
+
+        num_classes = len(self.observed_classes)
+        threshold = 1.0 / num_classes if num_classes > 1 else 0.0
+
+        for model in self.models:
+            proba = model.predict_proba_one(x)
+
+            acc = model.cluster_metrics[cluster_id].get()
+            weight = acc if acc > threshold else 0.0
+
+            proba = {k: v * weight for k, v in proba.items()}
+            y_pred.update(proba)
+
+        total = sum(y_pred.values())
+        if total > 0:
+            return {k: v / total for k, v in y_pred.items()}
+        return y_pred
+
+    def predict_one(self, x):
+        proba = self.predict_proba_one(x)
+        if proba:
+            return max(proba, key=proba.get)
+        return None
