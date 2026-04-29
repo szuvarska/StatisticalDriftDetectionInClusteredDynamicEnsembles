@@ -1040,7 +1040,116 @@ class BaseSRPClassifierSDDM(BaseSRPEstimator):
             return max(y_proba, key=y_proba.get)
         return None
     
+import collections
+import random
+from river import base
+from river import cluster
+from river.metrics import Accuracy
+from river.drift import ADWIN
+from river.tree import HoeffdingTreeClassifier
+from river.utils.random import poisson
+
+class BaseSRPClassifierSDDM(BaseSRPEstimator):
+    """Class representing the base learner of SRPClassifier with local ADWIN tracking."""
+
+    def __init__(
+        self,
+        idx_original: int,
+        model: base.Classifier,
+        metric,
+        created_on: int,
+        drift_detector: base.DriftDetector,
+        warning_detector: base.DriftDetector,
+        is_background_learner,
+        rng,
+        features=None,
+    ):
+        super().__init__(
+            idx_original=idx_original,
+            model=model,
+            metric=metric,
+            created_on=created_on,
+            drift_detector=drift_detector,      
+            warning_detector=warning_detector,
+            is_background_learner=is_background_learner,
+            rng=rng,
+            features=features,
+        )
+        # Default dictionary so new clusters automatically start with a fresh metric
+        self.cluster_metrics = collections.defaultdict(lambda: metric.clone())
+        self.t = 0
+
+    def learn_one(
+        self,
+        x: dict,
+        y,
+        *,
+        w: int,
+        n_samples_seen: int,
+        cluster_id: int = None,
+        **kwargs,
+    ):
+        self.t += 1
+        all_features = list(x.keys())
+        
+        # --- Subspace selection ---
+        if self.features is not None:
+            x_subset = {k: x[k] for k in self.features if k in x}
+        else:
+            x_subset = x
+
+        # Evaluate prediction before training for ADWIN (Test-then-Train)
+        if not self.disable_drift_detector and not self.is_background_learner:
+            correctly_classifies = self.model.predict_one(x_subset) == y
+
+        # --- Training ---
+        for _ in range(int(w)):
+            self.model.learn_one(x=x_subset, y=y)
+
+        # --- Background learner training ---
+        if self._background_learner:
+            self._background_learner.learn_one(
+                x=x,
+                y=y,
+                w=w,
+                n_samples_seen=n_samples_seen,
+                cluster_id=cluster_id
+            )
+
+        # --- Local Drift Detection (ADWIN) ---
+        if not self.disable_drift_detector and not self.is_background_learner:
+            # Check for warnings to initialize a background learner
+            if not self.disable_background_learner:
+                self.warning_detector.update(int(not correctly_classifies))
+                if self.warning_detector.drift_detected:
+                    self.n_warnings_detected += 1
+                    self._trigger_warning(all_features=all_features, n_samples_seen=n_samples_seen)
+
+            # Check for actual concept drift (Error spike)
+            self.drift_detector.update(int(not correctly_classifies))
+            if self.drift_detector.drift_detected:
+                self.n_drifts_detected += 1
+                # Hard reset: Model is replaced with background learner or a completely new tree.
+                # Note: This does NOT clear cluster_metrics. SDDM handles spatial competence.
+                self.reset(all_features=all_features, n_samples_seen=n_samples_seen)
+
+    def predict_proba_one(self, x):
+        # Select the features to use based on the model's assigned subspace
+        if self.features is not None:
+            x_subset = {k: x[k] for k in self.features if k in x}
+        else:
+            x_subset = x
+        return self.model.predict_proba_one(x_subset)
+
+    def predict_one(self, x):
+        y_proba = self.predict_proba_one(x)
+        if y_proba:
+            return max(y_proba, key=y_proba.get)
+        return None
+    
+
 class SRPClassifierSDDM(BaseSRPEnsemble, base.Classifier):
+    """Streaming Random Patches ensemble classifier extended with cluster-based SDDM."""
 
     def __init__(
         self,
@@ -1049,14 +1158,32 @@ class SRPClassifierSDDM(BaseSRPEnsemble, base.Classifier):
         subspace_size=0.6,
         training_method="patches",
         lam=6,
+        drift_detector=None,     
+        warning_detector=None,   
+        disable_detector="off",  # Default 'off' ensures local ADWINs are active
         seed=None,
         metric=None,
         n_clusters=5,
         sddm_constructor=None,
-        printer=True, # Dodajemy flagę printer tutaj
+        printer=True, 
     ):
         if model is None:
             model = HoeffdingTreeClassifier(grace_period=50, delta=0.01)
+
+        # Initialize default ADWIN detectors if none are provided
+        if drift_detector is None:
+            drift_detector = ADWIN(delta=1e-5)
+        if warning_detector is None:
+            warning_detector = ADWIN(delta=1e-4)
+            
+        # Logic for disabling local model detectors based on parameter
+        if disable_detector == "off":
+            pass
+        elif disable_detector == "drift":
+            drift_detector = None
+            warning_detector = None
+        elif disable_detector == "warning":
+            warning_detector = None
 
         if metric is None:
             metric = Accuracy()
@@ -1067,9 +1194,9 @@ class SRPClassifierSDDM(BaseSRPEnsemble, base.Classifier):
             subspace_size=subspace_size,
             training_method=training_method,
             lam=lam,
-            drift_detector=None,        # WYŁĄCZONE
-            warning_detector=None,
-            disable_detector="drift",
+            drift_detector=drift_detector,      
+            warning_detector=warning_detector,  
+            disable_detector=disable_detector,
             seed=seed,
             metric=metric,
         )
@@ -1085,6 +1212,7 @@ class SRPClassifierSDDM(BaseSRPEnsemble, base.Classifier):
         self.printer = printer
 
     def _get_detector(self, cluster_id):
+        # Lazy initialization of SDDM for a specific cluster
         if cluster_id not in self.cluster_detectors:
             self.cluster_detectors[cluster_id] = self.sddm_constructor()
         return self.cluster_detectors[cluster_id]
@@ -1102,6 +1230,8 @@ class SRPClassifierSDDM(BaseSRPEnsemble, base.Classifier):
                     model=self.model,
                     metric=self.metric,
                     created_on=self._n_samples_seen,
+                    drift_detector=self.drift_detector,      
+                    warning_detector=self.warning_detector,  
                     is_background_learner=False,
                     rng=self._rng,
                     features=subspace,
@@ -1115,25 +1245,25 @@ class SRPClassifierSDDM(BaseSRPEnsemble, base.Classifier):
         if not self.models:
             self._init_ensemble(list(x.keys()))
 
-        # cluster update
+        # Update clusterer and get the active region for this instance
         self.clusterer.learn_one(x)
         cluster_id = self.clusterer.predict_one(x)
 
-        # --- 1. GLOBALNY SDDM DLA AKTUALNEGO KLASTRA ---
+        # --- 1. GLOBAL SDDM TRACKING FOR CURRENT CLUSTER ---
         detector = self._get_detector(cluster_id)
         detector.update(x, y)
         
-        # Flaga RiverSDDM (_drift_detected) określa, czy w tej iteracji padł dryf
         drift_in_cluster = detector._drift_detected
 
         if drift_in_cluster and self.printer:
             self.n_drift_detected +=1
             r = detector.get_drift_report()
             print(f"[DRIFT ENSEMBLE] Instance: {self._n_samples_seen} | Cluster: {cluster_id} | Feature: {r['source']} | Mag: {r['magnitude']:.4f}")
-        # --- 2. TEST-THEN-TRAIN NA MODELACH BAZOWYCH ---
+
+        # --- 2. ENSEMBLE UPDATES (TEST-THEN-TRAIN) ---
         for model in self.models:
-            # A. RESET KOMPETENCJI: Jeśli cały zespół wie, że klaster ma dryf, 
-            # wyzeruj kompetencje w tym regionie zanim przewidzisz (model musi pracować od nowa)
+            # A. COMPETENCE RESET: If SDDM caught a drift, zero out competence 
+            # in this cluster so the model must re-earn its voting weight.
             if drift_in_cluster:
                 model.cluster_metrics[cluster_id] = self.metric.clone()
 
@@ -1142,7 +1272,7 @@ class SRPClassifierSDDM(BaseSRPEnsemble, base.Classifier):
             if y_pred is not None:
                 model.cluster_metrics[cluster_id].update(y, y_pred)
 
-            # C. BAGGING
+            # C. BAGGING (Poisson distribution for Random Patches / Resampling)
             k = poisson(rate=self.lam, rng=self._rng)
             if k == 0:
                 continue
@@ -1156,7 +1286,6 @@ class SRPClassifierSDDM(BaseSRPEnsemble, base.Classifier):
                 cluster_id=cluster_id,
             )
 
-    # --- Metody predict_proba_one i predict_one pozostają bez zmian! ---
     def predict_proba_one(self, x):
         y_pred = collections.Counter()
 
@@ -1164,20 +1293,26 @@ class SRPClassifierSDDM(BaseSRPEnsemble, base.Classifier):
             self._init_ensemble(list(x.keys()))
             return y_pred
 
+        # Find which cluster this instance belongs to
         cluster_id = self.clusterer.predict_one(x)
 
+        # Calculate the Better-than-Random threshold (C-DES Rule)
         num_classes = len(self.observed_classes)
         threshold = 1.0 / num_classes if num_classes > 1 else 0.0
 
         for model in self.models:
             proba = model.predict_proba_one(x)
 
+            # Get model accuracy strictly for this active cluster
             acc = model.cluster_metrics[cluster_id].get()
+            
+            # Deactivate model (weight=0) if it performs worse than random guessing here
             weight = acc if acc > threshold else 0.0
 
             proba = {k: v * weight for k, v in proba.items()}
             y_pred.update(proba)
 
+        # Normalize the probabilities
         total = sum(y_pred.values())
         if total > 0:
             return {k: v / total for k, v in y_pred.items()}
