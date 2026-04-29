@@ -1026,8 +1026,6 @@ class BaseSRPClassifierSDDM(BaseSRPEstimator):
                 cluster_id=cluster_id
             )
 
-        # Logika SDDM została stąd USUNIĘTA
-
     def predict_proba_one(self, x):
         if self.features is not None:
             x_subset = {k: x[k] for k in self.features if k in x}
@@ -1081,7 +1079,7 @@ class SRPClassifierSDDM(BaseSRPEnsemble, base.Classifier):
         self.clusterer = cluster.KMeans(n_clusters=n_clusters, seed=seed)
         self.observed_classes = set()
 
-        # Konstruktor detektora na poziomie zespołu
+        self.n_drift_detected = 0
         self.sddm_constructor = sddm_constructor
         self.cluster_detectors = {}
         self.printer = printer
@@ -1129,6 +1127,7 @@ class SRPClassifierSDDM(BaseSRPEnsemble, base.Classifier):
         drift_in_cluster = detector._drift_detected
 
         if drift_in_cluster and self.printer:
+            self.n_drift_detected +=1
             r = detector.get_drift_report()
             print(f"[DRIFT ENSEMBLE] Instance: {self._n_samples_seen} | Cluster: {cluster_id} | Feature: {r['source']} | Mag: {r['magnitude']:.4f}")
         # --- 2. TEST-THEN-TRAIN NA MODELACH BAZOWYCH ---
