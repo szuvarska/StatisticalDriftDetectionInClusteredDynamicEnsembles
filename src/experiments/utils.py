@@ -12,11 +12,11 @@ from river.drift import ADWIN
 from river.utils import Rolling
 from river.ensemble import SRPClassifier as VanillaSRP
 
-from src.streaming_random_patches import SRPClassifier as CDES_SRP
+from src.streaming_random_patches import SRPClassifier as CDES_SRP, SRPClassifierSDDM as CDES_SRP_SDDM
 
 # Model factory
 def make_models(n_models=10, n_clusters=2, drift_delta=1e-5, warn_delta=1e-4,
-                include_vanilla=True, include_cdes=True, srp_seed=42, extra_cdes_kwargs=None):
+                include_vanilla=True, include_cdes=True, include_cdes_sddm=True, include_cdes_sddm_adwin=True, srp_seed=42, extra_cdes_kwargs=None):
     """
     Returns a dict of initialized models similar to the original notebook.
     """
@@ -36,6 +36,28 @@ def make_models(n_models=10, n_clusters=2, drift_delta=1e-5, warn_delta=1e-4,
             drift_detector=ADWIN(delta=drift_delta),
             warning_detector=ADWIN(delta=warn_delta),
             seed=srp_seed,
+            **extra_cdes_kwargs
+        )
+    if include_cdes_sddm:
+        models["C-DES(SDDM)"] = CDES_SRP_SDDM(
+            n_models=n_models,
+            n_clusters=n_clusters,
+            drift_detector=ADWIN(delta=drift_delta),
+            warning_detector=ADWIN(delta=warn_delta),
+            seed=srp_seed,
+            disable_detector="drift",
+            printer=False,
+            **extra_cdes_kwargs
+        )
+    if include_cdes_sddm_adwin:
+        models["C-DES(SDDM+ADWIN)"] = CDES_SRP_SDDM(
+            n_models=n_models,
+            n_clusters=n_clusters,
+            drift_detector=ADWIN(delta=drift_delta),
+            warning_detector=ADWIN(delta=warn_delta),
+            seed=srp_seed,
+            disable_detector="off",
+            printer=False,
             **extra_cdes_kwargs
         )
     return models

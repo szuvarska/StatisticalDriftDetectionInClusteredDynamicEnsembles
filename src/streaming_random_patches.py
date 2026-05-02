@@ -16,6 +16,8 @@ from river.utils.random import poisson
 
 from river import cluster
 
+from src.river_sddm import RiverSDDM
+
 
 class BaseSRPEnsemble(base.Wrapper, base.Ensemble):
     """Base class for the sRP ensemble family"""
@@ -1040,14 +1042,15 @@ class BaseSRPClassifierSDDM(BaseSRPEstimator):
             return max(y_proba, key=y_proba.get)
         return None
     
-import collections
-import random
-from river import base
-from river import cluster
-from river.metrics import Accuracy
-from river.drift import ADWIN
-from river.tree import HoeffdingTreeClassifier
-from river.utils.random import poisson
+def make_sddm():
+    return RiverSDDM(
+        n_bins=10,
+        ref_window_size=400,
+        cur_window_size=100,
+        threshold=0.6,
+        incremental=False
+    )
+
 
 class BaseSRPClassifierSDDM(BaseSRPEstimator):
     """Class representing the base learner of SRPClassifier with local ADWIN tracking."""
@@ -1164,7 +1167,7 @@ class SRPClassifierSDDM(BaseSRPEnsemble, base.Classifier):
         seed=None,
         metric=None,
         n_clusters=5,
-        sddm_constructor=None,
+        sddm_constructor=make_sddm,
         printer=True, 
     ):
         if model is None:
