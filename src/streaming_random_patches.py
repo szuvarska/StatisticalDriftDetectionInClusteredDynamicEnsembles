@@ -13,6 +13,7 @@ from river.metrics import MAE, Accuracy
 from river.metrics.base import ClassificationMetric, Metric, RegressionMetric
 from river.tree import HoeffdingTreeClassifier, HoeffdingTreeRegressor
 from river.utils.random import poisson
+from river.utils import Rolling
 
 from river import cluster
 
@@ -48,6 +49,7 @@ class BaseSRPEnsemble(base.Wrapper, base.Ensemble):
             disable_weighted_vote: bool = False,
             seed: int | None = None,
             metric: Metric | None = None,
+            **kwargs,
     ):
         # List of models is properly initialized later
         super().__init__([])  # type: ignore
@@ -235,6 +237,7 @@ class BaseSRPEstimator:
             is_background_learner,
             rng: random.Random,
             features=None,
+            **kwargs,
     ):
         self.idx_original = idx_original
         self.created_on = created_on
@@ -302,7 +305,7 @@ class BaseSRPEstimator:
             self.drift_detector = self._background_learner.drift_detector
             self.warning_detector = self._background_learner.warning_detector
             self.metric = self._background_learner.metric
-            self.created_on = self._background_learner.created_on
+            self.created_on = n_samples_seen
             self.features = self._background_learner.features
             self._background_learner = None
         else:
@@ -316,7 +319,12 @@ class BaseSRPEstimator:
             self.model = self.model.clone()
             self.metric = self.metric.clone()
             self.created_on = n_samples_seen
-            self.drift_detector = self.drift_detector.clone()
+
+            if self.drift_detector is not None:
+                self.drift_detector = self.drift_detector.clone()
+            if getattr(self, "warning_detector", None) is not None:
+                self.warning_detector = self.warning_detector.clone()
+
             self.features = subspace
 
 
@@ -447,6 +455,7 @@ class SRPClassifier(BaseSRPEnsemble, base.Classifier):
             seed: int | None = None,
             metric: ClassificationMetric | None = None,
             n_clusters: int = 5,  # Configurable cluster count
+            **kwargs,
     ):
         if model is None:
             model = HoeffdingTreeClassifier(grace_period=50, delta=0.01)
@@ -461,7 +470,6 @@ class SRPClassifier(BaseSRPEnsemble, base.Classifier):
             pass
         elif disable_detector == "drift":
             drift_detector = None
-            warning_detector = None
         elif disable_detector == "warning":
             warning_detector = None
         else:
@@ -492,6 +500,14 @@ class SRPClassifier(BaseSRPEnsemble, base.Classifier):
         self.clusterer = cluster.KMeans(n_clusters=n_clusters, seed=seed) if n_clusters > 0 else None
         self.observed_classes = set()  # To track observed classes for clustering
 
+        # Track local class counts for Dynamic Threshold Fallback
+        self.cluster_class_counts = collections.defaultdict(lambda: collections.Counter())
+
+        # Use a Rolling window of 100 to smoothly adapt to moving cluster boundaries
+        self.cluster_metrics = collections.defaultdict(
+            lambda: Rolling(metric.clone(), window_size=100)  # type: ignore
+        )
+
     def learn_one(self, x: dict, y: base.typing.Target, **kwargs):
         self._n_samples_seen += 1
         self.observed_classes.add(y)
@@ -500,24 +516,33 @@ class SRPClassifier(BaseSRPEnsemble, base.Classifier):
             self._init_ensemble(list(x.keys()))
 
         # Update clusterer and get the active region
-        self.clusterer.learn_one(x)
-        cluster_id = self.clusterer.predict_one(x)
+        cluster_id = None
+        if self.clusterer is not None:
+            self.clusterer.learn_one(x)
+            cluster_id = self.clusterer.predict_one(x)
+            # Update local majority distribution
+            self.cluster_class_counts[cluster_id][y] += 1
 
-        for model in self:
-            # Test-then-train: Score the model on this specific cluster before training
-            y_pred = model.predict_one(x)
+        self._update_ensemble(x, y, cluster_id, **kwargs)
+        return self
+
+    def _update_ensemble(self, x: dict, y: base.typing.Target, cluster_id: int | None, **kwargs):
+        """Helper method to update the ensemble with the new instance, including local cluster tracking."""
+        for model in self.models:
+            # Test-then-train: Score locally
+            y_pred = model.predict_one(x, **kwargs)
             if y_pred is not None:
-                # We update the cluster-specific metric, not the global one
-                model.cluster_metrics[cluster_id].update(y_true=y, y_pred=y_pred)
+                if cluster_id is not None:
+                    model.cluster_metrics[cluster_id].update(y, y_pred)
 
-            # Train the model (pass the cluster_id down)
             if self.training_method == self._TRAIN_RANDOM_SUBSPACES:
                 k = 1
             else:
                 k = poisson(rate=self.lam, rng=self._rng)
                 if k == 0:
                     continue
-            model.learn_one(x=x, y=y, w=k, n_samples_seen=self._n_samples_seen, cluster_id=cluster_id)
+
+            model.learn_one(x=x, y=y, w=k, n_samples_seen=self._n_samples_seen, cluster_id=cluster_id, **kwargs)
 
     def predict_proba_one(self, x, **kwargs):
         y_pred = collections.Counter()
@@ -527,29 +552,53 @@ class SRPClassifier(BaseSRPEnsemble, base.Classifier):
             return y_pred
 
         # Find which cluster this instance belongs to
-        cluster_id = self.clusterer.predict_one(x)
+        cluster_id = None
+        if self.clusterer is not None:
+            cluster_id = self.clusterer.predict_one(x)
 
-        # Calculate the Better-than-Random threshold
-        num_classes = len(self.observed_classes)
-        threshold = 1.0 / num_classes if num_classes > 1 else 0.0
+        # Dynamic local better-than-random threshold calculation
+        threshold = 0.0
+        if cluster_id is not None:
+            counts = self.cluster_class_counts[cluster_id]
+            total_counts = sum(counts.values())
+            if total_counts > 0:
+                threshold = max(counts.values()) / total_counts
+            else:
+                num_classes = len(self.observed_classes)
+                threshold = 1.0 / num_classes if num_classes > 1 else 0.0
 
-        # Dynamic Ensemble Selection (Soft Deactivation)
+        weights_sum = 0.0
+
         for model in self.models:
-            y_proba_temp = model.predict_proba_one(x, **kwargs)
+            proba = model.predict_proba_one(x, **kwargs)
+            if cluster_id is not None:
+                # We update the rolling metric with test-then-train logic
+                acc = model.cluster_metrics[cluster_id].get() if model.cluster_metrics[cluster_id].get() > 0 else 1.0
+            else:
+                acc = model.metric.get()
 
-            # metric_value = model.metric.get()
+            if not self.disable_weighted_vote:
+                weight = acc if acc >= threshold else 0.0
+                proba = {k: v * weight for k, v in proba.items()}
+                weights_sum += weight
 
-            # Get the model's accuracy specifically for this cluster
-            cluster_accuracy = model.cluster_metrics[cluster_id].get()
+            y_pred.update(proba)
 
-            if not self.disable_weighted_vote:  # and metric_value > 0.0:
-                # The C-DES Rule: If worse than random, weight is 0 (deactivated)
-                weight = cluster_accuracy if cluster_accuracy > threshold else 0.0
-
-                # y_proba_temp = {k: val * metric_value for k, val in y_proba_temp.items()}
-                y_proba_temp = {k: val * weight for k, val in y_proba_temp.items()}
-
-            y_pred.update(y_proba_temp)
+        # If ALL models are worse than the local majority class,
+        # the smartest prediction is simply the cluster's true majority class (dummy classifier).
+        if weights_sum == 0.0 and not self.disable_weighted_vote:
+            if cluster_id is not None and sum(self.cluster_class_counts[cluster_id].values()) > 0:
+                majority_class = max(self.cluster_class_counts[cluster_id],
+                                     key=self.cluster_class_counts[cluster_id].get)
+                return {majority_class: 1.0}
+            else:
+                y_pred = collections.Counter()
+                for model in self.models:
+                    proba = model.predict_proba_one(x, **kwargs)
+                    # Global weight vote to guarantee we don't return an empty prediction
+                    weight = model.metric.get() if model.metric.get() > 0 else 0.0
+                    proba = {k: v * weight for k, v in proba.items()}
+                    y_pred.update(proba)
 
         total = sum(y_pred.values())
         if total > 0:
@@ -571,6 +620,7 @@ class BaseSRPClassifier(BaseSRPEstimator):
             is_background_learner,
             rng: random.Random,
             features=None,
+            **kwargs,
     ):
         super().__init__(
             idx_original=idx_original,
@@ -582,17 +632,13 @@ class BaseSRPClassifier(BaseSRPEstimator):
             is_background_learner=is_background_learner,
             rng=rng,
             features=features,
+            **kwargs,
         )
 
-        # Default dictionary so new clusters automatically start with a fresh metric
-        self.cluster_metrics = collections.defaultdict(lambda: metric.clone())
-
-        self.is_batch_detector = hasattr(self.drift_detector, "process_batch")
-
-        if self.is_batch_detector:
-            self._x_buffer = []
-            self._y_buffer = []
-            self.p_size = getattr(self.drift_detector, "p_size", 500)
+        self.cluster_metrics = collections.defaultdict(
+            lambda: Rolling(metric.clone(), window_size=100)  # type: ignore
+        )
+        self.t = 0
 
     def learn_one(
             self,
@@ -604,12 +650,18 @@ class BaseSRPClassifier(BaseSRPEstimator):
             cluster_id: int = None,
             **kwargs,
     ):
+        self.t += 1
+        all_features = list(x.keys())
+
         if self.features is not None:
             # Select the subset of features to use
             x_subset = {k: x[k] for k in self.features if k in x}
         else:
             # Use all features
             x_subset = x
+
+        if not self.disable_drift_detector and not self.is_background_learner:
+            correctly_classifies = self.model.predict_one(x_subset, **kwargs) == y  # type: ignore[attr-defined]
 
         for _ in range(int(w)):
             self.model.learn_one(x=x_subset, y=y, **kwargs)  # type: ignore[attr-defined]
@@ -623,37 +675,28 @@ class BaseSRPClassifier(BaseSRPEstimator):
                 y=y,  # type: ignore[arg-type]
                 w=w,
                 n_samples_seen=n_samples_seen,  # type: ignore
-                cluster_id=cluster_id  # Pass cluster_id down
+                cluster_id=cluster_id,  # Pass cluster_id down
+                **kwargs,
             )
 
         if not self.disable_drift_detector and not self.is_background_learner:
-            correctly_classifies = self.model.predict_one(x_subset) == y  # type: ignore[attr-defined]
             # Check for warnings only if the background learner is active
             if not self.disable_background_learner:
                 # Update the warning detection method
                 self.warning_detector.update(int(not correctly_classifies))
                 # Check if there was a change
                 if self.warning_detector.drift_detected:
-                    all_features = list(x.keys())
                     self.n_warnings_detected += 1
                     self._trigger_warning(all_features=all_features, n_samples_seen=n_samples_seen)
 
-            # ===== Drift detection =====
-            # Update the drift detection method
-            # TODO: make change for SDDM
             self.drift_detector.update(int(not correctly_classifies))
             # Check if there was a change
             if self.drift_detector.drift_detected:
                 self.n_drifts_detected += 1
 
-                # all_features = list(x.keys())
-                # # There was a change, reset the model
-                # self.reset(all_features=all_features, n_samples_seen=n_samples_seen)
-
-                if cluster_id is not None:
-                    # We do NOT call self.reset(). We keep the tree but zero its competence.
-                    # This forces it to re-earn its voting rights in this specific region.
-                    self.cluster_metrics[cluster_id] = self.metric.clone()
+                # Fallback to Vanilla SRP Hard Reset
+                self.reset(all_features=all_features, n_samples_seen=n_samples_seen)
+                self.cluster_metrics.clear()
 
     def predict_proba_one(self, x, **kwargs):
         # Select the features to use
@@ -957,7 +1000,7 @@ class BaseSRPRegressor(BaseSRPEstimator):
             # ===== Drift detection =====
             # Update the drift detection method
             self.drift_detector.update(drift_detector_input)
-            # Check if the was a change
+            # Check if there was a change
             if self.drift_detector.drift_detected:
                 self.n_drifts_detected += 1
                 # There was a change, reset the model
@@ -970,78 +1013,6 @@ class BaseSRPRegressor(BaseSRPEstimator):
         return self.model.predict_one(x_subset, **kwargs)
 
 
-class BaseSRPClassifierSDDM(BaseSRPEstimator):
-
-    def __init__(
-        self,
-        idx_original: int,
-        model: base.Classifier,
-        metric,
-        created_on: int,
-        is_background_learner,
-        rng,
-        features=None,
-    ):
-        # Usuwamy drift_detector, warning_detector, zostawiamy None tak jak było
-        super().__init__(
-            idx_original=idx_original,
-            model=model,
-            metric=metric,
-            created_on=created_on,
-            drift_detector=None,  
-            warning_detector=None,
-            is_background_learner=is_background_learner,
-            rng=rng,
-            features=features,
-        )
-        self.cluster_metrics = collections.defaultdict(lambda: metric.clone())
-        self.t = 0
-
-    def learn_one(
-        self,
-        x: dict,
-        y,
-        *,
-        w: int,
-        n_samples_seen: int,
-        cluster_id: int = None,
-        **kwargs,
-    ):
-        self.t += 1
-        # --- subspace ---
-        if self.features is not None:
-            x_subset = {k: x[k] for k in self.features if k in x}
-        else:
-            x_subset = x
-
-        # --- trening ---
-        for _ in range(int(w)):
-            self.model.learn_one(x=x_subset, y=y)
-
-        # --- background learner ---
-        if self._background_learner:
-            self._background_learner.learn_one(
-                x=x,
-                y=y,
-                w=w,
-                n_samples_seen=n_samples_seen,
-                cluster_id=cluster_id
-            )
-
-    def predict_proba_one(self, x):
-        if self.features is not None:
-            x_subset = {k: x[k] for k in self.features if k in x}
-        else:
-            x_subset = x
-
-        return self.model.predict_proba_one(x_subset)
-
-    def predict_one(self, x):
-        y_proba = self.predict_proba_one(x)
-        if y_proba:
-            return max(y_proba, key=y_proba.get)
-        return None
-    
 def make_sddm():
     return RiverSDDM(
         n_bins=10,
@@ -1052,277 +1023,71 @@ def make_sddm():
     )
 
 
-class BaseSRPClassifierSDDM(BaseSRPEstimator):
-    """Class representing the base learner of SRPClassifier with local ADWIN tracking."""
+class SRPClassifierSDDM(SRPClassifier):
+    """Streaming Random Patches ensemble extended with cluster-based SDDM.
+        Inherits structural C-DES components from SRPClassifier."""
 
     def __init__(
-        self,
-        idx_original: int,
-        model: base.Classifier,
-        metric,
-        created_on: int,
-        drift_detector: base.DriftDetector,
-        warning_detector: base.DriftDetector,
-        is_background_learner,
-        rng,
-        features=None,
+            self,
+            sddm_constructor=make_sddm,
+            printer=True,
+            major_drift_factor=1.5,
+            **kwargs,
     ):
-        super().__init__(
-            idx_original=idx_original,
-            model=model,
-            metric=metric,
-            created_on=created_on,
-            drift_detector=drift_detector,      
-            warning_detector=warning_detector,
-            is_background_learner=is_background_learner,
-            rng=rng,
-            features=features,
-        )
-        # Default dictionary so new clusters automatically start with a fresh metric
-        self.cluster_metrics = collections.defaultdict(lambda: metric.clone())
-        self.t = 0
-
-    def learn_one(
-        self,
-        x: dict,
-        y,
-        *,
-        w: int,
-        n_samples_seen: int,
-        cluster_id: int = None,
-        **kwargs,
-    ):
-        self.t += 1
-        all_features = list(x.keys())
-        
-        # --- Subspace selection ---
-        if self.features is not None:
-            x_subset = {k: x[k] for k in self.features if k in x}
-        else:
-            x_subset = x
-
-        # Evaluate prediction before training for ADWIN (Test-then-Train)
-        if not self.disable_drift_detector and not self.is_background_learner:
-            correctly_classifies = self.model.predict_one(x_subset) == y
-
-        # --- Training ---
-        for _ in range(int(w)):
-            self.model.learn_one(x=x_subset, y=y)
-
-        # --- Background learner training ---
-        if self._background_learner:
-            self._background_learner.learn_one(
-                x=x,
-                y=y,
-                w=w,
-                n_samples_seen=n_samples_seen,
-                cluster_id=cluster_id
-            )
-
-        # --- Local Drift Detection (ADWIN) ---
-        if not self.disable_drift_detector and not self.is_background_learner:
-            # Check for warnings to initialize a background learner
-            if not self.disable_background_learner:
-                self.warning_detector.update(int(not correctly_classifies))
-                if self.warning_detector.drift_detected:
-                    self.n_warnings_detected += 1
-                    self._trigger_warning(all_features=all_features, n_samples_seen=n_samples_seen)
-
-            # Check for actual concept drift (Error spike)
-            self.drift_detector.update(int(not correctly_classifies))
-            if self.drift_detector.drift_detected:
-                self.n_drifts_detected += 1
-                # Hard reset: Model is replaced with background learner or a completely new tree.
-                # Note: This does NOT clear cluster_metrics. SDDM handles spatial competence.
-                self.reset(all_features=all_features, n_samples_seen=n_samples_seen)
-
-    def predict_proba_one(self, x):
-        # Select the features to use based on the model's assigned subspace
-        if self.features is not None:
-            x_subset = {k: x[k] for k in self.features if k in x}
-        else:
-            x_subset = x
-        return self.model.predict_proba_one(x_subset)
-
-    def predict_one(self, x):
-        y_proba = self.predict_proba_one(x)
-        if y_proba:
-            return max(y_proba, key=y_proba.get)
-        return None
-    
-
-class SRPClassifierSDDM(BaseSRPEnsemble, base.Classifier):
-    """Streaming Random Patches ensemble classifier extended with cluster-based SDDM."""
-
-    def __init__(
-        self,
-        model=None,
-        n_models=10,
-        subspace_size=0.6,
-        training_method="patches",
-        lam=6,
-        drift_detector=None,     
-        warning_detector=None,   
-        disable_detector="off",  # Default 'off' ensures local ADWINs are active
-        seed=None,
-        metric=None,
-        n_clusters=5,
-        sddm_constructor=make_sddm,
-        printer=True, 
-    ):
-        if model is None:
-            model = HoeffdingTreeClassifier(grace_period=50, delta=0.01)
-
-        # Initialize default ADWIN detectors if none are provided
-        if drift_detector is None:
-            drift_detector = ADWIN(delta=1e-5)
-        if warning_detector is None:
-            warning_detector = ADWIN(delta=1e-4)
-            
-        # Logic for disabling local model detectors based on parameter
-        if disable_detector == "off":
-            pass
-        elif disable_detector == "drift":
-            drift_detector = None
-            warning_detector = None
-        elif disable_detector == "warning":
-            warning_detector = None
-
-        if metric is None:
-            metric = Accuracy()
-
-        super().__init__(
-            model=model,
-            n_models=n_models,
-            subspace_size=subspace_size,
-            training_method=training_method,
-            lam=lam,
-            drift_detector=drift_detector,      
-            warning_detector=warning_detector,  
-            disable_detector=disable_detector,
-            seed=seed,
-            metric=metric,
-        )
-
-        self._base_learner_class = BaseSRPClassifierSDDM
-
-        self.clusterer = cluster.KMeans(n_clusters=n_clusters, seed=seed)
-        self.observed_classes = set()
-
-        self.n_drift_detected = 0
+        super().__init__(**kwargs)
         self.sddm_constructor = sddm_constructor
-        self.cluster_detectors = {}
         self.printer = printer
+        self.major_drift_factor = major_drift_factor
+        self.cluster_detectors = {}
+        self.n_drift_detected = 0
 
     def _get_detector(self, cluster_id):
-        # Lazy initialization of SDDM for a specific cluster
         if cluster_id not in self.cluster_detectors:
             self.cluster_detectors[cluster_id] = self.sddm_constructor()
         return self.cluster_detectors[cluster_id]
 
-    def _init_ensemble(self, features):
-        self._generate_subspaces(features)
-        subspace_indexes = list(range(self.n_models))
-        self._rng.shuffle(subspace_indexes)
-
-        for i in range(self.n_models):
-            subspace = self._subspaces[subspace_indexes[i]]
-            self.append(
-                self._base_learner_class(
-                    idx_original=i,
-                    model=self.model,
-                    metric=self.metric,
-                    created_on=self._n_samples_seen,
-                    drift_detector=self.drift_detector,      
-                    warning_detector=self.warning_detector,  
-                    is_background_learner=False,
-                    rng=self._rng,
-                    features=subspace,
-                )
-            )
-
-    def learn_one(self, x, y):
+    def learn_one(
+            self, x: dict, y: base.typing.Target, **kwargs
+    ):
         self._n_samples_seen += 1
         self.observed_classes.add(y)
 
         if not self.models:
             self._init_ensemble(list(x.keys()))
 
-        # Update clusterer and get the active region for this instance
-        self.clusterer.learn_one(x)
-        cluster_id = self.clusterer.predict_one(x)
+        cluster_id = None
+        if self.clusterer is not None:
+            self.clusterer.learn_one(x)
+            cluster_id = self.clusterer.predict_one(x)
+            self.cluster_class_counts[cluster_id][y] += 1
 
-        # --- 1. GLOBAL SDDM TRACKING FOR CURRENT CLUSTER ---
-        detector = self._get_detector(cluster_id)
-        detector.update(x, y)
-        
-        drift_in_cluster = detector._drift_detected
+            # SDDM specific global region tracking
+            detector = self._get_detector(cluster_id)
+            detector.update(x, y)
+            report = detector.get_drift_report()
 
-        if drift_in_cluster and self.printer:
-            self.n_drift_detected +=1
-            r = detector.get_drift_report()
-            print(f"[DRIFT ENSEMBLE] Instance: {self._n_samples_seen} | Cluster: {cluster_id} | Feature: {r['source']} | Mag: {r['magnitude']:.4f}")
+            is_major_drift = False
+            if report["detected"]:
+                self.n_drift_detected += 1
+                mag = report["magnitude"]
+                major_thresh = detector.threshold * self.major_drift_factor
+                is_major_drift = mag >= major_thresh
 
-        # --- 2. ENSEMBLE UPDATES (TEST-THEN-TRAIN) ---
-        for model in self.models:
-            # A. COMPETENCE RESET: If SDDM caught a drift, zero out competence 
-            # in this cluster so the model must re-earn its voting weight.
-            if drift_in_cluster:
-                model.cluster_metrics[cluster_id] = self.metric.clone()
+                if self.printer:
+                    print(
+                        f"[DRIFT ENSEMBLE] Instance: {self._n_samples_seen} | Cluster: {cluster_id} | Feature: {report['source']} | Mag: {mag:.4f}")
 
-            # B. TEST
-            y_pred = model.predict_one(x)
-            if y_pred is not None:
-                model.cluster_metrics[cluster_id].update(y, y_pred)
+            for model in self.models:
+                # 1. MINOR DRIFT: Always perform Soft Reset (local competence clear)
+                if report["detected"]:
+                    model.cluster_metrics.pop(cluster_id, None)
 
-            # C. BAGGING (Poisson distribution for Random Patches / Resampling)
-            k = poisson(rate=self.lam, rng=self._rng)
-            if k == 0:
-                continue
+                # 2. MAJOR DRIFT: Only perform Hard Reset if ADWIN (global drift) is disabled
+                # If ADWIN is 'off' (enabled), we let ADWIN handle the global hard resets.
+                if is_major_drift and self.disable_detector == "drift":
+                    model.reset(all_features=list(x.keys()), n_samples_seen=self._n_samples_seen)
+                    model.cluster_metrics.clear()
 
-            # D. TRAIN
-            model.learn_one(
-                x=x,
-                y=y,
-                w=k,
-                n_samples_seen=self._n_samples_seen,
-                cluster_id=cluster_id,
-            )
-
-    def predict_proba_one(self, x):
-        y_pred = collections.Counter()
-
-        if not self.models:
-            self._init_ensemble(list(x.keys()))
-            return y_pred
-
-        # Find which cluster this instance belongs to
-        cluster_id = self.clusterer.predict_one(x)
-
-        # Calculate the Better-than-Random threshold (C-DES Rule)
-        num_classes = len(self.observed_classes)
-        threshold = 1.0 / num_classes if num_classes > 1 else 0.0
-
-        for model in self.models:
-            proba = model.predict_proba_one(x)
-
-            # Get model accuracy strictly for this active cluster
-            acc = model.cluster_metrics[cluster_id].get()
-            
-            # Deactivate model (weight=0) if it performs worse than random guessing here
-            weight = acc if acc > threshold else 0.0
-
-            proba = {k: v * weight for k, v in proba.items()}
-            y_pred.update(proba)
-
-        # Normalize the probabilities
-        total = sum(y_pred.values())
-        if total > 0:
-            return {k: v / total for k, v in y_pred.items()}
-        return y_pred
-
-    def predict_one(self, x):
-        proba = self.predict_proba_one(x)
-        if proba:
-            return max(proba, key=proba.get)
-        return None
+        # Divert back to base implementation for bagging & training
+        self._update_ensemble(x, y, cluster_id, **kwargs)
+        return self
