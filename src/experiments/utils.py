@@ -12,7 +12,7 @@ from river.drift import ADWIN
 from river.utils import Rolling
 from river.ensemble import SRPClassifier as VanillaSRP
 
-from src.streaming_random_patches import SRPClassifier as CDES_SRP, SRPClassifierSDDM as CDES_SRP_SDDM
+from src.streaming_random_patches import SRPClassifierADWIN as CDES_SRP, SRPClassifierSDDM as CDES_SRP_SDDM
 
 # Model factory
 def make_models(n_models=10, n_clusters=2, drift_delta=1e-5, warn_delta=1e-4,
@@ -35,6 +35,7 @@ def make_models(n_models=10, n_clusters=2, drift_delta=1e-5, warn_delta=1e-4,
             n_clusters=n_clusters,
             drift_detector=ADWIN(delta=drift_delta),
             warning_detector=ADWIN(delta=warn_delta),
+            disable_detector='drift',
             seed=srp_seed,
             **extra_cdes_kwargs
         )
@@ -47,6 +48,7 @@ def make_models(n_models=10, n_clusters=2, drift_delta=1e-5, warn_delta=1e-4,
             seed=srp_seed,
             disable_detector="drift",
             printer=False,
+            major_drift_factor=3.0,
             **extra_cdes_kwargs
         )
     if include_cdes_sddm_adwin:
@@ -58,6 +60,7 @@ def make_models(n_models=10, n_clusters=2, drift_delta=1e-5, warn_delta=1e-4,
             seed=srp_seed,
             disable_detector="off",
             printer=False,
+            major_drift_factor=3.0,
             **extra_cdes_kwargs
         )
     return models
@@ -427,13 +430,10 @@ def run_experiment_6():
     print("Initializing Experiment 6: The Curse of Dimensionality (Noise Injection)...")
     noise_levels = [0,10,50,100]
     n_samples = 5000
-    final_results = {"Vanilla SRP": [], "C-DES SRP": []}
+    final_results = {"Vanilla SRP": [], "C-DES SRP": [], "C-DES(SDDM)": [], "C-DES(SDDM+ADWIN)": []}
     for noise_val in noise_levels:
         print(f"\n--- Testing with {noise_val} injected noise features ---")
-        models = {
-            "Vanilla SRP": VanillaSRP(n_models=10, drift_detector=ADWIN(), seed=42),
-            "C-DES SRP": CDES_SRP(n_models=10, n_clusters=3, drift_detector=ADWIN(), seed=42)
-        }
+        models = make_models(n_models=10, n_clusters=2)
         acc_trackers = {name: metrics.Accuracy() for name in models.keys()}
         stream = NoisyAgrawalStream(n_noise_features=noise_val, n_samples=n_samples)
         for i, (x, y) in enumerate(stream):
@@ -451,7 +451,9 @@ def run_experiment_6():
     print("\nExperiment complete. Generating plot...")
     plt.figure(figsize=(10,6))
     plt.plot(noise_levels, final_results["Vanilla SRP"], marker='o', markersize=8, linewidth=2.5, label="Vanilla SRP")
-    plt.plot(noise_levels, final_results["C-DES SRP"], marker='X', markersize=8, linewidth=2.5, linestyle='--', color='red', label="C-DES SRP")
+    plt.plot(noise_levels, final_results["C-DES SRP"], marker='X', markersize=8, linewidth=2.5, linestyle='--', color='yellow', label="C-DES SRP")
+    plt.plot(noise_levels, final_results["C-DES(SDDM)"], marker='s', markersize=8, linewidth=2.5, linestyle='-.', color='green', label="C-DES(SDDM)")
+    plt.plot(noise_levels, final_results["C-DES(SDDM+ADWIN)"], marker='D', markersize=8, linewidth=2.5, linestyle=':', color='red', label="C-DES(SDDM+ADWIN)")
     plt.title("Robustness to Irrelevant Features")
     plt.xlabel("Number of Injected Noise Features")
     plt.ylabel("Final Cumulative Accuracy")

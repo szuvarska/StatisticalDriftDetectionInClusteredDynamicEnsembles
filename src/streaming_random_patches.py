@@ -1013,6 +1013,59 @@ class BaseSRPRegressor(BaseSRPEstimator):
         return self.model.predict_one(x_subset, **kwargs)
 
 
+class SRPClassifierADWIN(SRPClassifier):
+    """Streaming Random Patches ensemble extended with global ADWIN."""
+
+    def __init__(
+            self,
+            printer=True,
+            **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.printer = printer
+        self.n_drift_detected = 0
+
+        self.cluster_drift_detectors = {}
+
+        self.delta = 1e-5
+
+    def _get_cluster_detectors(self, cluster_id):
+        if cluster_id not in self.cluster_drift_detectors:
+            self.cluster_drift_detectors[cluster_id] = ADWIN(delta=self.delta)
+
+        return self.cluster_drift_detectors[cluster_id]
+
+    def learn_one(self, x: dict, y: base.typing.Target, **kwargs):
+        self._n_samples_seen += 1
+        self.observed_classes.add(y)
+
+        if not self.models:
+            self._init_ensemble(list(x.keys()))
+
+        # Update clusterer and get the active region
+        cluster_id = None
+        if self.clusterer is not None:
+            self.clusterer.learn_one(x)
+            cluster_id = self.clusterer.predict_one(x)
+            # Update local majority distribution
+            self.cluster_class_counts[cluster_id][y] += 1
+
+            y_pred_ensemble = self.predict_one(x)
+            is_error = int(y_pred_ensemble != y) if y_pred_ensemble is not None else 0
+
+            drift_det = self._get_cluster_detectors(cluster_id)
+            drift_det.update(is_error)
+
+            if drift_det.drift_detected:
+                self.cluster_drift_detectors[cluster_id] = ADWIN(delta=self.delta)
+
+            for model in self.models:
+                model.cluster_metrics.pop(cluster_id, None)
+
+        self._update_ensemble(x, y, cluster_id, **kwargs)
+        return self
+
+
 def make_sddm():
     return RiverSDDM(
         n_bins=10,
