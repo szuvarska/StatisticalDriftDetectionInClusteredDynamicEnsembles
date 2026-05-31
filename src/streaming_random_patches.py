@@ -1132,7 +1132,7 @@ class SRPClassifierSDDM(SRPClassifier):
                 if mag_std > 0:
                     z_score = (mag - mag_mean) / mag_std
                     # computing z-score, it is for detected drift, 1.96 is for over 95% CI
-                    is_major_drift = z_score > 1.0
+                    is_major_drift = mag > (mag_mean + mag_std * self.major_drift_factor)
                     
 
                 if self.printer:
