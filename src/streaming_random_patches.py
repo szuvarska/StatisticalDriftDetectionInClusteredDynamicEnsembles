@@ -17,7 +17,7 @@ from river.utils import Rolling
 
 from river import cluster
 
-from src.river_sddm import RiverSDDM
+from old_river_sddm import RiverSDDM
 
 
 class BaseSRPEnsemble(base.Wrapper, base.Ensemble):
@@ -1123,8 +1123,17 @@ class SRPClassifierSDDM(SRPClassifier):
             if report["detected"]:
                 self.n_drift_detected += 1
                 mag = report["magnitude"]
-                major_thresh = detector.threshold * self.major_drift_factor
-                is_major_drift = mag >= major_thresh
+                # major_thresh = detector.threshold * self.major_drift_factor
+                mag_mean = report.get("mag_mean", 0.0)
+                mag_std = report.get("mag_std", 0.0)
+                
+                is_major_drift = False
+
+                if mag_std > 0:
+                    z_score = (mag - mag_mean) / mag_std
+                    # computing z-score, it is for detected drift, 1.96 is for over 95% CI
+                    is_major_drift = z_score > 1.0
+                    
 
                 if self.printer:
                     print(
