@@ -12,6 +12,7 @@ class RiverSDDM(base.DriftDetector):
         test_interval=10,
         threshold=0.6,
         alpha=1.0,
+        min_mag_samples = 50,
         incremental=True,
         printer=False
     ):
@@ -55,9 +56,10 @@ class RiverSDDM(base.DriftDetector):
         self._source_feature = None
         self._last_drifts_list = []
 
-        # Window to track the history of drift magnitudes (e.g., last 50 measurements)
+        # Window to track the history of drift magnitudes (e.g., last 50 measurements,but out of curr window)
         # Used for dynamic Z-score thresholding
-        self.mag_window = deque(maxlen=50)
+        self._mag_delay = self.cur_window_size // self.test_interval
+        self.mag_window = deque(maxlen=min_mag_samples+self._mag_delay)
         
         # Track current mean and std internally to avoid breaking Z-test logic
         self._current_mag_mean = 0.0
@@ -220,8 +222,9 @@ class RiverSDDM(base.DriftDetector):
 
             # Calculate historical stats BEFORE adding the new magnitude (Z-test requirement)
             if len(self.mag_window) == self.mag_window.maxlen:
-                self._current_mag_mean = float(np.mean(self.mag_window))
-                self._current_mag_std = float(np.std(self.mag_window))
+                mags_before_drift = list(self.mag_window)[:-self._mag_delay]
+                self._current_mag_mean = float(np.mean(mags_before_drift))
+                self._current_mag_std = float(np.std(mags_before_drift))
             else:
                 self._current_mag_mean = 0.0
                 self._current_mag_std = 0.0
