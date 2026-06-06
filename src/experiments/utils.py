@@ -237,13 +237,25 @@ class NoiseQuarantineStream:
             yield x, y, region
 
 # Simple plotting helpers
-def plot_time_series(x_axis, series_dict, title="", ylabel="Accuracy", vlines=None, y_lim=None, figsize=(12,4)):
+def plot_time_series(x_axis, series_dict, title="", ylabel="Accuracy", vlines=None, y_lim=None, figsize=(12,4), real_drifts=None, drift_detections=None):
     plt.figure(figsize=figsize)
     for name, series in series_dict.items():
-        plt.plot(x_axis[:len(series)], series, label=name)
+        line = plt.plot(x_axis[:len(series)], series, label=name)[0]
+        if drift_detections and name in drift_detections:
+            drifts = drift_detections[name]
+            if drifts:
+                # Plot cross markers strictly at the point of detection along the series curve to avoid limit scaling issues
+                y_vals = [series[min(len(series)-1, int(d / (x_axis[1]-x_axis[0])))] for d in drifts]
+                plt.scatter(drifts, y_vals, marker='X', color=line.get_color(), edgecolors='black', linewidths=1.5, alpha=1.0, s=120, zorder=10)
+                
     if vlines:
         for v in vlines:
             plt.axvline(x=v, color='red', linestyle=':', alpha=0.8)
+    
+    if real_drifts:
+        for i, v in enumerate(real_drifts):
+            plt.axvline(x=v, color='black', linestyle='--', linewidth=2, alpha=0.7, label="Real Drift" if i == 0 else "")
+            
     plt.title(title)
     plt.ylabel(ylabel)
     plt.legend()
@@ -263,7 +275,9 @@ def run_experiment_1():
         "Region B": Rolling(metrics.Accuracy(), window_size=250),
         "history_A": [],
         "history_B": [],
-        "history_Global": []
+        "history_Global": [],
+        "drifts": [],
+        "last_drifts": 0
     })
     stream = RegionalDriftStream(drift_interval=2500, n_samples=10000)
     print("Processing stream...")
@@ -274,6 +288,12 @@ def run_experiment_1():
                 results[name]["Global"].update(y, y_pred)
                 results[name][region].update(y, y_pred)
             model.learn_one(x, y)
+            
+            d_count = sum([getattr(bm, "n_drifts_detected", 0) for bm in getattr(model, "models", [])])
+            if d_count > results[name]["last_drifts"]:
+                results[name]["drifts"].append(i)
+                results[name]["last_drifts"] = d_count
+                
             if i % 10 == 0:
                 results[name]["history_Global"].append(results[name]["Global"].get())
                 results[name]["history_A"].append(results[name]["Region A"].get())
@@ -282,18 +302,22 @@ def run_experiment_1():
             print(f"Processed {i + 1} samples...")
     print("Experiment complete. Generating plots...")
     x_axis = range(0, 10000, 10)
+    
+    r_drifts = [2500, 5000, 7500]
+    d_dets = {n: results[n]["drifts"] for n in models.keys()}
+    
     # Global
     plot_time_series(x_axis,
                      {name: results[name]["history_Global"] for name in results.keys()},
-                     title="Global Accuracy (Prequential, Window=500)")
+                     title="Global Accuracy (Prequential, Window=500)", real_drifts=r_drifts, drift_detections=d_dets)
     # Region A
     plot_time_series(x_axis,
                      {name: results[name]["history_A"] for name in results.keys()},
-                     title="Region A Accuracy (Stable Concept)")
+                     title="Region A Accuracy (Stable Concept)", real_drifts=r_drifts, drift_detections=d_dets)
     # Region B
     plot_time_series(x_axis,
                      {name: results[name]["history_B"] for name in results.keys()},
-                     title="Region B Accuracy (Drifting Concept)")
+                     title="Region B Accuracy (Drifting Concept)", real_drifts=r_drifts, drift_detections=d_dets)
 
 def run_experiment_2():
     print("Initializing Experiment 2: Contextual Sensor Drift...")
@@ -304,7 +328,9 @@ def run_experiment_2():
         "High Temp (Drifting)": Rolling(metrics.Accuracy(), window_size=250),
         "history_Global": [],
         "history_Stable": [],
-        "history_Drifting": []
+        "history_Drifting": [],
+        "drifts": [],
+        "last_drifts": 0
     })
     stream = SensorFailureStream(drift_start=4000, n_samples=10000)
     print("Processing stream...")
@@ -315,6 +341,12 @@ def run_experiment_2():
                 results[name]["Global"].update(y, y_pred)
                 results[name][region].update(y, y_pred)
             model.learn_one(x, y)
+            
+            d_count = sum([getattr(bm, "n_drifts_detected", 0) for bm in getattr(model, "models", [])])
+            if d_count > results[name]["last_drifts"]:
+                results[name]["drifts"].append(i)
+                results[name]["last_drifts"] = d_count
+                
             if i % 20 == 0:
                 results[name]["history_Global"].append(results[name]["Global"].get())
                 results[name]["history_Stable"].append(results[name]["Low Temp (Stable)"].get())
@@ -323,20 +355,23 @@ def run_experiment_2():
             print(f"Processed {i + 1} samples...")
     print("Experiment complete. Generating plots...")
     x_axis = range(0, 10000, 20)
+    r_drifts = [4000]
+    d_dets = {n: results[n]["drifts"] for n in models.keys()}
+    
     plot_time_series(x_axis,
                      {name: results[name]["history_Global"] for name in results.keys()},
-                     title="Global Accuracy (Window=500)")
+                     title="Global Accuracy (Window=500)", real_drifts=r_drifts, drift_detections=d_dets)
     plot_time_series(x_axis,
                      {name: results[name]["history_Stable"] for name in results.keys()},
-                     title="Low Temp Region (Concept remains stable)")
+                     title="Low Temp Region (Concept remains stable)", real_drifts=r_drifts, drift_detections=d_dets)
     plot_time_series(x_axis,
                      {name: results[name]["history_Drifting"] for name in results.keys()},
-                     title="High Temp Region (Concept Inverts at Sample 4000)")
+                     title="High Temp Region (Concept Inverts at Sample 4000)", real_drifts=r_drifts, drift_detections=d_dets)
 
 def run_experiment_3():
     print("Initializing Experiment 3: Recurrent Drift (A -> B -> A)...")
     models = make_models(n_models=10, n_clusters=2)
-    results = defaultdict(lambda: {"Accuracy": Rolling(metrics.Accuracy(), window_size=250), "history": []})
+    results = defaultdict(lambda: {"Accuracy": Rolling(metrics.Accuracy(), window_size=250), "history": [], "drifts": [], "last_drifts": 0})
     stream = RecurrentDriftStream(phase_length=5000)
     print("Processing stream...")
     for i, (x, y, phase) in enumerate(stream):
@@ -345,14 +380,22 @@ def run_experiment_3():
             if y_pred is not None:
                 results[name]["Accuracy"].update(y, y_pred)
             model.learn_one(x, y)
+            
+            d_count = sum([getattr(bm, "n_drifts_detected", 0) for bm in getattr(model, "models", [])])
+            if d_count > results[name]["last_drifts"]:
+                results[name]["drifts"].append(i)
+                results[name]["last_drifts"] = d_count
+                
             if i % 25 == 0:
                 results[name]["history"].append(results[name]["Accuracy"].get())
         if (i + 1) % 3000 == 0:
             print(f"Processed {i + 1} samples...")
     print("Experiment complete. Generating plot...")
     x_axis = range(0, 15000, 25)
+    r_drifts = [5000, 10000]
+    d_dets = {n: results[n]["drifts"] for n in models.keys()}
     plot_time_series(x_axis, {name: results[name]["history"] for name in results.keys()},
-                     title="Recurrent Drift (A->B->A) - Rolling Accuracy", y_lim=(0.4,1.05))
+                     title="Recurrent Drift (A->B->A) - Rolling Accuracy", y_lim=(0.4,1.05), real_drifts=r_drifts, drift_detections=d_dets)
 
 def run_experiment_4():
     print("Initializing Experiment 4: Rapid Concept Flickering...")
@@ -361,7 +404,8 @@ def run_experiment_4():
         "Rolling_Acc": Rolling(metrics.Accuracy(), window_size=100),
         "Cumulative_Acc": metrics.Accuracy(),
         "history_rolling": [],
-        "history_cumulative": []
+        "history_cumulative": [],
+        "drifts": [], "last_drifts": 0
     })
     stream = RapidFlickerStream(flicker_interval=250, n_samples=10000)
     print("Processing stream...")
@@ -372,6 +416,12 @@ def run_experiment_4():
                 results[name]["Rolling_Acc"].update(y, y_pred)
                 results[name]["Cumulative_Acc"].update(y, y_pred)
             model.learn_one(x, y)
+            
+            d_count = sum([getattr(bm, "n_drifts_detected", 0) for bm in getattr(model, "models", [])])
+            if d_count > results[name]["last_drifts"]:
+                results[name]["drifts"].append(i)
+                results[name]["last_drifts"] = d_count
+                
             if i % 10 == 0:
                 results[name]["history_rolling"].append(results[name]["Rolling_Acc"].get())
                 results[name]["history_cumulative"].append(results[name]["Cumulative_Acc"].get())
@@ -379,10 +429,12 @@ def run_experiment_4():
             print(f"Processed {i + 1} samples...")
     print("Experiment complete. Generating plots...")
     x_axis = range(0, 10000, 10)
+    r_drifts = list(range(250, 10000, 250))
+    d_dets = {n: results[n]["drifts"] for n in models.keys()}
     plot_time_series(x_axis, {name: results[name]["history_rolling"] for name in results.keys()},
-                     title="Responsiveness: Prequential Accuracy (Window = 100)")
+                     title="Responsiveness: Prequential Accuracy (Window = 100)", real_drifts=r_drifts, drift_detections=d_dets)
     plot_time_series(x_axis, {name: results[name]["history_cumulative"] for name in results.keys()},
-                     title="Overall Robustness: Cumulative Accuracy")
+                     title="Overall Robustness: Cumulative Accuracy", real_drifts=r_drifts, drift_detections=d_dets)
 
 def run_experiment_5():
     print("Initializing Experiment 5: Hyperparameter Sensitivity (Cluster Count k)...")
@@ -392,7 +444,8 @@ def run_experiment_5():
         models[f"C-DES (k={k})"] = CDES_SRP(n_models=10, n_clusters=k, drift_detector=ADWIN(delta=1e-5), seed=42)
     results = defaultdict(lambda: {"Rolling_Acc": Rolling(metrics.Accuracy(), window_size=500),
                                    "Cumulative_Acc": metrics.Accuracy(),
-                                   "history_rolling": [], "total_time": 0.0})
+                                   "history_rolling": [], "total_time": 0.0,
+                                   "drifts": [], "last_drifts": 0})
     stream = MultiContextStream(phase_length=2500, n_samples=10000)
     print("Processing stream and measuring latency...")
     for i, (x, y) in enumerate(stream):
@@ -404,14 +457,22 @@ def run_experiment_5():
                 results[name]["Cumulative_Acc"].update(y, y_pred)
             model.learn_one(x, y)
             results[name]["total_time"] += (time.perf_counter() - start_time)
+            
+            d_count = sum([getattr(bm, "n_drifts_detected", 0) for bm in getattr(model, "models", [])])
+            if d_count > results[name]["last_drifts"]:
+                results[name]["drifts"].append(i)
+                results[name]["last_drifts"] = d_count
+            
             if i % 25 == 0:
                 results[name]["history_rolling"].append(results[name]["Rolling_Acc"].get())
         if (i + 1) % 2500 == 0:
             print(f"Processed {i + 1} samples...")
     print("Experiment complete. Generating plots...")
     x_axis = range(0, 10000, 25)
+    r_drifts = [2500, 5000, 7500]
+    d_dets = {n: results[n]["drifts"] for n in models.keys()}
     plot_time_series(x_axis, {name: results[name]["history_rolling"] for name in results.keys()},
-                     title="Prequential Accuracy (Window = 500)")
+                     title="Prequential Accuracy (Window = 500)", real_drifts=r_drifts, drift_detections=d_dets)
     # Latency vs accuracy scatter
     names = list(results.keys())
     accuracies = [results[n]["Cumulative_Acc"].get() * 100 for n in names]
@@ -477,7 +538,8 @@ def run_experiment_7():
         "Rolling_Acc": Rolling(metrics.Accuracy(), window_size=1000),
         "Cumulative_Acc": metrics.Accuracy(),
         "Kappa": metrics.CohenKappa(),
-        "history_rolling": [], "total_time": 0.0
+        "history_rolling": [], "total_time": 0.0,
+        "drifts": [], "last_drifts": 0
     })
     stream = BenchmarkDriftStream(seed=42)
     n_samples = 40000
@@ -492,14 +554,29 @@ def run_experiment_7():
                 results[name]["Kappa"].update(y, y_pred)
             model.learn_one(x, y)
             results[name]["total_time"] += (time.perf_counter() - start_time)
+            
+            # Record resets / drifts
+            if hasattr(model, 'models'):
+                d_count = sum([getattr(bm, "n_drifts_detected", 0) for bm in model.models])
+                if d_count > results[name]["last_drifts"]:
+                    results[name]["drifts"].append(i)
+                    results[name]["last_drifts"] = d_count
+            elif hasattr(model, 'n_drifts_detected'):
+                if model.n_drifts_detected > results[name]["last_drifts"]:
+                    results[name]["drifts"].append(i)
+                    results[name]["last_drifts"] = model.n_drifts_detected
+            
             if i % 100 == 0:
                 results[name]["history_rolling"].append(results[name]["Rolling_Acc"].get())
         if (i + 1) % 10000 == 0:
             print(f"Processed {i + 1} samples (Concept Drift Triggered)...")
     print("\nExperiment complete. Generating plot and summary table...")
     x_axis = range(0, n_samples, 100)
+    r_drifts = [10000, 20000, 30000]
+    d_dets = {n: results[n]["drifts"] for n in models.keys()}
     plot_time_series(x_axis, {name: results[name]["history_rolling"] for name in results.keys()},
-                     title="Benchmark Performance on SEA Concepts (Rolling Window = 1000)")
+                     title="Benchmark Performance on SEA Concepts (Rolling Window = 1000)", 
+                     real_drifts=r_drifts, drift_detections=d_dets)
     data = []
     for name in results.keys():
         acc = results[name]["Cumulative_Acc"].get()
@@ -522,7 +599,8 @@ def run_experiment_8():
         window_size = 100 if n_samples < 5000 else 1000
         dataset_results = defaultdict(lambda: {"Rolling_Acc": Rolling(metrics.Accuracy(), window_size=window_size),
                                                "Cumulative_Acc": metrics.Accuracy(),
-                                               "history_rolling": [], "total_time": 0.0})
+                                               "history_rolling": [], "total_time": 0.0,
+                                               "drifts": [], "last_drifts": 0})
         for i, (x, y) in enumerate(stream):
             for model_name, model in models.items():
                 start_time = time.perf_counter()
@@ -532,6 +610,12 @@ def run_experiment_8():
                     dataset_results[model_name]["Cumulative_Acc"].update(y, y_pred)
                 model.learn_one(x, y)
                 dataset_results[model_name]["total_time"] += (time.perf_counter() - start_time)
+                
+                d_count = sum([getattr(bm, "n_drifts_detected", 0) for bm in getattr(model, "models", [])])
+                if d_count > dataset_results[model_name]["last_drifts"]:
+                    dataset_results[model_name]["drifts"].append(i)
+                    dataset_results[model_name]["last_drifts"] = d_count
+                
                 if i % (max(1, window_size // 10)) == 0:
                     dataset_results[model_name]["history_rolling"].append(dataset_results[model_name]["Rolling_Acc"].get())
             if (i + 1) % max(1, (n_samples // 4)) == 0:
@@ -540,8 +624,13 @@ def run_experiment_8():
         print(f"Finished {dataset_name}.\n")
     print("All streams processed. Generating plots and tables...")
     # Plot per dataset
-    for dataset_name, (_, _stream, n) in zip(all_results.keys(), benchmark_datasets):
-        pass
+    for dataset_name, _, n in benchmark_datasets:
+        results = all_results[dataset_name]
+        window_size = 100 if n < 5000 else 1000
+        x_axis = range(0, n, max(1, window_size // 10))
+        d_dets = {m: results[m]["drifts"] for m in results.keys()}
+        plot_time_series(x_axis, {m: results[m]["history_rolling"] for m in results.keys()},
+                         title=f"Real-World Data: {dataset_name} (Window={window_size})", drift_detections=d_dets)
     # Show summary
     data = []
     for dataset_name, _, n_samples in benchmark_datasets:
@@ -561,7 +650,7 @@ def run_experiment_9():
         "C-DES (Ablated: Pure Majority Vote)": CDES_SRP(n_models=10, n_clusters=2, disable_weighted_vote=True, drift_detector=ADWIN(), seed=42),
         "C-DES (Full: Soft Deactivation)": CDES_SRP(n_models=10, n_clusters=2, disable_weighted_vote=False, drift_detector=ADWIN(), seed=42)
     }
-    results = defaultdict(lambda: {"Rolling_Acc": Rolling(metrics.Accuracy(), window_size=250), "Cumulative_Acc": metrics.Accuracy(), "history_rolling": []})
+    results = defaultdict(lambda: {"Rolling_Acc": Rolling(metrics.Accuracy(), window_size=250), "Cumulative_Acc": metrics.Accuracy(), "history_rolling": [], "drifts": [], "last_drifts": 0})
     stream = ConflictingContextStream(n_samples=12000, flicker_rate=3000)
     print("Processing stream...")
     for i, (x, y) in enumerate(stream):
@@ -571,14 +660,23 @@ def run_experiment_9():
                 results[name]["Rolling_Acc"].update(y, y_pred)
                 results[name]["Cumulative_Acc"].update(y, y_pred)
             model.learn_one(x, y)
+            
+            d_count = sum([getattr(bm, "n_drifts_detected", 0) for bm in getattr(model, "models", [])])
+            if d_count > results[name]["last_drifts"]:
+                results[name]["drifts"].append(i)
+                results[name]["last_drifts"] = d_count
+            
             if i % 20 == 0:
                 results[name]["history_rolling"].append(results[name]["Rolling_Acc"].get())
         if (i + 1) % 3000 == 0:
             print(f"Processed {i + 1} samples...")
     print("Experiment complete. Generating plots...")
     x_axis = range(0, 12000, 20)
+    r_drifts = [3000, 6000, 9000]
+    d_dets = {n: results[n]["drifts"] for n in models.keys()}
     plot_time_series(x_axis, {name: results[name]["history_rolling"] for name in results.keys()},
-                     title="Ablation Study: Impact of Soft Deactivation on Conflicting Concepts")
+                     title="Ablation Study: Impact of Soft Deactivation on Conflicting Concepts",
+                     real_drifts=r_drifts, drift_detections=d_dets)
 
 def run_experiment_10():
     print("Initializing Experiment 10: The Quarantine Effect (Ensemble Churn)...")
@@ -587,7 +685,7 @@ def run_experiment_10():
         "C-DES (Local Soft Resets)": CDES_SRP(n_models=10, n_clusters=3, drift_detector=ADWIN(delta=1e-4), seed=42)
     }
     results = defaultdict(lambda: {"Stable_Acc": Rolling(metrics.Accuracy(), window_size=500),
-                                   "history_stable_acc": [], "history_drifts": []})
+                                   "history_stable_acc": [], "history_drifts": [], "drifts": [], "last_drifts": 0})
     stream = NoiseQuarantineStream(n_samples=12000, noise_start=3000)
     print("Processing stream...")
     for i, (x, y, region) in enumerate(stream):
@@ -596,18 +694,28 @@ def run_experiment_10():
             if y_pred is not None and region == "Stable Regions":
                 results[name]["Stable_Acc"].update(y, y_pred)
             model.learn_one(x, y)
+            
+            d_count = sum([getattr(bm, "n_drifts_detected", 0) for bm in getattr(model, "models", [])])
+            if d_count > results[name]["last_drifts"]:
+                results[name]["drifts"].append(i)
+                results[name]["last_drifts"] = d_count
+            
             if i % 50 == 0:
                 results[name]["history_stable_acc"].append(results[name]["Stable_Acc"].get())
-                total_drifts = sum([getattr(base_model, "n_drifts_detected", 0) for base_model in model.models])
+                total_drifts = sum([getattr(base_model, "n_drifts_detected", 0) for base_model in getattr(model, "models", [])])
                 results[name]["history_drifts"].append(total_drifts)
         if (i + 1) % 3000 == 0:
             print(f"Processed {i + 1} samples...")
     print("Experiment complete. Generating plots...")
     x_axis = range(0, 12000, 50)
+    r_drifts = [3000]
+    d_dets = {n: results[n]["drifts"] for n in models.keys()}
     plot_time_series(x_axis, {name: results[name]["history_stable_acc"] for name in results.keys()},
-                     title="Collateral Damage: Accuracy on STABLE Regions Only")
+                     title="Collateral Damage: Accuracy on STABLE Regions Only",
+                     real_drifts=r_drifts, drift_detections=d_dets)
     plot_time_series(x_axis, {name: results[name]["history_drifts"] for name in results.keys()},
-                     title="Ensemble Churn: Cumulative Drift Detections Triggered")
+                     title="Ensemble Churn: Cumulative Drift Detections Triggered",
+                     real_drifts=r_drifts)
 
 def run_all_experiments():
     run_experiment_1()
