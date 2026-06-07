@@ -5,6 +5,7 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 import itertools
+import os
 
 from river import metrics, datasets
 from river.datasets import synth
@@ -235,6 +236,84 @@ class NoiseQuarantineStream:
                 else:
                     x, y = next(iter_a); x['context'] = 1.0; region="Stable Regions"
             yield x, y, region
+
+# ---------------------------------------------------------
+# Helpers for external real-world datasets
+# ---------------------------------------------------------
+def load_csv_as_stream(csv_path: str, target_col: str, n_samples: int | None = None):
+    """
+    Load a CSV file and yield (x_dict, y) tuples compatible with River.
+    """
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
+    df = pd.read_csv(csv_path)
+    total = len(df) if n_samples is None else min(len(df), n_samples)
+    for _, row in df.iloc[:total].iterrows():
+        x = row.drop(labels=[target_col]).to_dict()
+        # Clean up NaNs and convert typical numpy types to standard python types for River
+        for k, v in list(x.items()):
+            if pd.isna(v):
+                x.pop(k)
+            elif isinstance(v, (np.floating, float)):
+                x[k] = float(v)
+            elif isinstance(v, (np.integer, int)):
+                x[k] = int(v)
+        y = row[target_col]
+        yield x, y
+
+def fetch_dynamic_dataset_stream(name: str, n_samples: int = 15000):
+    """
+    Dynamically loads large real-world datasets without needing local CSV files natively.
+    Relies on scikit-learn to download and cache them safely outside the repo.
+    """
+    try:
+        from sklearn.datasets import fetch_covtype, fetch_openml
+    except ImportError:
+        print(f"[WARN] Please install scikit-learn (`pip install scikit-learn`) to auto-download {name}.")
+        return []
+
+    if name == "covtype":
+        print("  -> Downloading/Loading Forest Covertype (this may take a moment)...")
+        data = fetch_covtype(as_frame=True)
+        df = data.frame
+        target_col = "Cover_Type"
+    elif name == "airlines":
+        print("  -> Downloading/Loading Airlines dataset from OpenML (this may take a moment)...")
+        # Airlines dataset (OpenML ID: 1169) - Predicts flight delays, has spatial features (airports)
+        data = fetch_openml("airlines", version=1, as_frame=True, parser="auto")
+        df = data.frame
+        target_col = "Delay"
+    else:
+        return []
+
+    # Convert features to floats so K-Means distance calculations don't crash
+    for col in df.columns:
+        if col != target_col and df[col].dtype.name in ['category', 'object', 'string']:
+            df[col] = df[col].astype('category').cat.codes.astype(float)
+            
+    # Convert target to integer classes
+    if df[target_col].dtype.name in ['category', 'object', 'string']:
+        df[target_col] = df[target_col].astype('category').cat.codes
+
+    total = min(len(df), n_samples)
+    for _, row in df.iloc[:total].iterrows():
+        x = row.drop(labels=[target_col]).to_dict()
+        for k, v in list(x.items()):
+            if pd.isna(v):
+                x.pop(k)
+            elif isinstance(v, (np.floating, float)):
+                x[k] = float(v)
+            elif isinstance(v, (np.integer, int)):
+                x[k] = int(v)
+            # handle any left-over string categories cleanly via hashing
+            elif isinstance(v, str):
+                x[k] = float(hash(v) % 10000)
+                
+        # Ensure primitive Python scalar target
+        y_val = row[target_col]
+        if pd.isna(y_val) or (isinstance(y_val, (int, np.integer)) and y_val < 0):
+            continue
+        yield x, int(y_val)
 
 # Simple plotting helpers
 def plot_time_series(x_axis, series_dict, title="", ylabel="Accuracy", vlines=None, y_lim=None, figsize=(12,4), real_drifts=None, drift_detections=None):
@@ -621,10 +700,23 @@ def run_experiment_7():
 
 def run_experiment_8():
     print("Initializing Experiment 8: Real-World Benchmarks...\n")
+    
+    # 1. Base Datasets
     benchmark_datasets = [
         ("Phishing Website Detection", datasets.Phishing(), 1250),
         ("Electricity Pricing", itertools.islice(datasets.Elec2(), 15000), 15000)
     ]
+    
+    # 2. Forest Covertype (Auto-downloaded globally)
+    covtype_stream = fetch_dynamic_dataset_stream("covtype", 15000)
+    if covtype_stream:
+        benchmark_datasets.append(("Forest Covertype", covtype_stream, 15000))
+        
+    # 3. Airlines (Auto-downloaded globally via OpenML)
+    airlines_stream = fetch_dynamic_dataset_stream("airlines", 15000)
+    if airlines_stream:
+        benchmark_datasets.append(("Airlines (Spatial/Geo)", airlines_stream, 15000))
+
     all_results = {}
     for dataset_name, stream, n_samples in benchmark_datasets:
         print(f"--- Evaluating on: {dataset_name} ({n_samples} samples) ---")
