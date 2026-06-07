@@ -15,12 +15,8 @@ from river.ensemble import SRPClassifier as VanillaSRP
 
 from src.streaming_random_patches import SRPClassifierADWIN as CDES_SRP, SRPClassifierSDDM as CDES_SRP_SDDM
 
-# Model factory
 def make_models(n_models=10, n_clusters=2, drift_delta=1e-5, warn_delta=1e-4,
                 include_vanilla=True, include_cdes=True, include_cdes_sddm=True, include_cdes_sddm_adwin=True, srp_seed=42, extra_cdes_kwargs=None):
-    """
-    Returns a dict of initialized models similar to the original notebook.
-    """
     extra_cdes_kwargs = extra_cdes_kwargs or {}
     models = {}
     if include_vanilla:
@@ -66,7 +62,6 @@ def make_models(n_models=10, n_clusters=2, drift_delta=1e-5, warn_delta=1e-4,
         )
     return models
 
-# Stream classes
 class RegionalDriftStream:
     def __init__(self, drift_interval=2000, n_samples=10000):
         self.drift_interval = drift_interval
@@ -237,20 +232,13 @@ class NoiseQuarantineStream:
                     x, y = next(iter_a); x['context'] = 1.0; region="Stable Regions"
             yield x, y, region
 
-# ---------------------------------------------------------
-# Helpers for external real-world datasets
-# ---------------------------------------------------------
 def load_csv_as_stream(csv_path: str, target_col: str, n_samples: int | None = None):
-    """
-    Load a CSV file and yield (x_dict, y) tuples compatible with River.
-    """
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"CSV not found: {csv_path}")
     df = pd.read_csv(csv_path)
     total = len(df) if n_samples is None else min(len(df), n_samples)
     for _, row in df.iloc[:total].iterrows():
         x = row.drop(labels=[target_col]).to_dict()
-        # Clean up NaNs and convert typical numpy types to standard python types for River
         for k, v in list(x.items()):
             if pd.isna(v):
                 x.pop(k)
@@ -262,10 +250,6 @@ def load_csv_as_stream(csv_path: str, target_col: str, n_samples: int | None = N
         yield x, y
 
 def fetch_dynamic_dataset_stream(name: str, n_samples: int = 15000):
-    """
-    Dynamically loads large real-world datasets without needing local CSV files natively.
-    Relies on scikit-learn to download and cache them safely outside the repo.
-    """
     try:
         from sklearn.datasets import fetch_covtype, fetch_openml
     except ImportError:
@@ -279,19 +263,16 @@ def fetch_dynamic_dataset_stream(name: str, n_samples: int = 15000):
         target_col = "Cover_Type"
     elif name == "airlines":
         print("  -> Downloading/Loading Airlines dataset from OpenML (this may take a moment)...")
-        # Airlines dataset (OpenML ID: 1169) - Predicts flight delays, has spatial features (airports)
         data = fetch_openml("airlines", version=1, as_frame=True, parser="auto")
         df = data.frame
         target_col = "Delay"
     else:
         return []
 
-    # Convert features to floats so K-Means distance calculations don't crash
     for col in df.columns:
         if col != target_col and df[col].dtype.name in ['category', 'object', 'string']:
             df[col] = df[col].astype('category').cat.codes.astype(float)
             
-    # Convert target to integer classes
     if df[target_col].dtype.name in ['category', 'object', 'string']:
         df[target_col] = df[target_col].astype('category').cat.codes
 
@@ -305,17 +286,14 @@ def fetch_dynamic_dataset_stream(name: str, n_samples: int = 15000):
                 x[k] = float(v)
             elif isinstance(v, (np.integer, int)):
                 x[k] = int(v)
-            # handle any left-over string categories cleanly via hashing
             elif isinstance(v, str):
                 x[k] = float(hash(v) % 10000)
                 
-        # Ensure primitive Python scalar target
         y_val = row[target_col]
         if pd.isna(y_val) or (isinstance(y_val, (int, np.integer)) and y_val < 0):
             continue
         yield x, int(y_val)
 
-# Simple plotting helpers
 def plot_time_series(x_axis, series_dict, title="", ylabel="Accuracy", vlines=None, y_lim=None, figsize=(12,4), real_drifts=None, drift_detections=None):
     plt.figure(figsize=figsize)
     for name, series in series_dict.items():
@@ -323,8 +301,8 @@ def plot_time_series(x_axis, series_dict, title="", ylabel="Accuracy", vlines=No
         if drift_detections and name in drift_detections:
             drifts = drift_detections[name]
             if drifts:
-                # Plot cross markers strictly at the point of detection along the series curve to avoid limit scaling issues
-                y_vals = [series[min(len(series)-1, int(d / (x_axis[1]-x_axis[0])))] for d in drifts]
+                x_coords = list(x_axis[:len(series)])
+                y_vals = np.interp(drifts, x_coords, series)
                 plt.scatter(drifts, y_vals, marker='X', color=line.get_color(), edgecolors='black', linewidths=1.5, alpha=1.0, s=120, zorder=10)
                 
     if vlines:
@@ -344,7 +322,26 @@ def plot_time_series(x_axis, series_dict, title="", ylabel="Accuracy", vlines=No
     plt.tight_layout()
     plt.show()
 
-# Experiment runners
+def get_total_drifts(model):
+    count = 0
+    try:
+        base_learners = getattr(model, "models", [])
+        if not base_learners and hasattr(model, '__iter__'):
+            base_learners = model
+        for bm in base_learners:
+            val = getattr(bm, "n_drifts_detected", 0)
+            if isinstance(val, (int, float)):
+                count += int(val)
+    except Exception:
+        pass
+        
+    for attr in ["n_drift_detected", "n_drifts_detected"]:
+        val = getattr(model, attr, 0)
+        if isinstance(val, (int, float)):
+            count += int(val)
+            
+    return count
+
 def run_experiment_1():
     print("Initializing Experiment 1: Regional Concept Drift...")
     models = make_models(n_models=10, n_clusters=2)
@@ -368,9 +365,10 @@ def run_experiment_1():
                 results[name][region].update(y, y_pred)
             model.learn_one(x, y)
             
-            d_count = sum([getattr(bm, "n_drifts_detected", 0) for bm in getattr(model, "models", [])])
+            d_count = get_total_drifts(model)
             if d_count > results[name]["last_drifts"]:
-                results[name]["drifts"].append(i)
+                if not results[name]["drifts"] or (i - results[name]["drifts"][-1]) > 50:
+                    results[name]["drifts"].append(i)
                 results[name]["last_drifts"] = d_count
                 
             if i % 10 == 0:
@@ -385,15 +383,12 @@ def run_experiment_1():
     r_drifts = [2500, 5000, 7500]
     d_dets = {n: results[n]["drifts"] for n in models.keys()}
     
-    # Global
     plot_time_series(x_axis,
                      {name: results[name]["history_Global"] for name in results.keys()},
                      title="Global Accuracy (Prequential, Window=500)", real_drifts=r_drifts, drift_detections=d_dets)
-    # Region A
     plot_time_series(x_axis,
                      {name: results[name]["history_A"] for name in results.keys()},
                      title="Region A Accuracy (Stable Concept)", real_drifts=r_drifts, drift_detections=d_dets)
-    # Region B
     plot_time_series(x_axis,
                      {name: results[name]["history_B"] for name in results.keys()},
                      title="Region B Accuracy (Drifting Concept)", real_drifts=r_drifts, drift_detections=d_dets)
@@ -421,9 +416,10 @@ def run_experiment_2():
                 results[name][region].update(y, y_pred)
             model.learn_one(x, y)
             
-            d_count = sum([getattr(bm, "n_drifts_detected", 0) for bm in getattr(model, "models", [])])
+            d_count = get_total_drifts(model)
             if d_count > results[name]["last_drifts"]:
-                results[name]["drifts"].append(i)
+                if not results[name]["drifts"] or (i - results[name]["drifts"][-1]) > 50:
+                    results[name]["drifts"].append(i)
                 results[name]["last_drifts"] = d_count
                 
             if i % 20 == 0:
@@ -460,9 +456,10 @@ def run_experiment_3():
                 results[name]["Accuracy"].update(y, y_pred)
             model.learn_one(x, y)
             
-            d_count = sum([getattr(bm, "n_drifts_detected", 0) for bm in getattr(model, "models", [])])
+            d_count = get_total_drifts(model)
             if d_count > results[name]["last_drifts"]:
-                results[name]["drifts"].append(i)
+                if not results[name]["drifts"] or (i - results[name]["drifts"][-1]) > 50:
+                    results[name]["drifts"].append(i)
                 results[name]["last_drifts"] = d_count
                 
             if i % 25 == 0:
@@ -496,9 +493,10 @@ def run_experiment_4():
                 results[name]["Cumulative_Acc"].update(y, y_pred)
             model.learn_one(x, y)
             
-            d_count = sum([getattr(bm, "n_drifts_detected", 0) for bm in getattr(model, "models", [])])
+            d_count = get_total_drifts(model)
             if d_count > results[name]["last_drifts"]:
-                results[name]["drifts"].append(i)
+                if not results[name]["drifts"] or (i - results[name]["drifts"][-1]) > 50:
+                    results[name]["drifts"].append(i)
                 results[name]["last_drifts"] = d_count
                 
             if i % 10 == 0:
@@ -537,9 +535,10 @@ def run_experiment_5():
             model.learn_one(x, y)
             results[name]["total_time"] += (time.perf_counter() - start_time)
             
-            d_count = sum([getattr(bm, "n_drifts_detected", 0) for bm in getattr(model, "models", [])])
+            d_count = get_total_drifts(model)
             if d_count > results[name]["last_drifts"]:
-                results[name]["drifts"].append(i)
+                if not results[name]["drifts"] or (i - results[name]["drifts"][-1]) > 50:
+                    results[name]["drifts"].append(i)
                 results[name]["last_drifts"] = d_count
             
             if i % 25 == 0:
@@ -552,7 +551,7 @@ def run_experiment_5():
     d_dets = {n: results[n]["drifts"] for n in models.keys()}
     plot_time_series(x_axis, {name: results[name]["history_rolling"] for name in results.keys()},
                      title="Prequential Accuracy (Window = 500)", real_drifts=r_drifts, drift_detections=d_dets)
-    # Latency vs accuracy scatter
+    
     names = list(results.keys())
     accuracies = [results[n]["Cumulative_Acc"].get() * 100 for n in names]
     latencies = [(results[n]["total_time"] / 10000) * 1000 for n in names]
@@ -564,14 +563,14 @@ def run_experiment_5():
     plt.xlabel("Average Latency (ms / sample)")
     plt.ylabel("Cumulative Accuracy (%)")
     plt.grid(True, linestyle=':', alpha=0.7)
-    plt.tight_layout(); plt.show()
+    plt.tight_layout()
+    plt.show()
 
 def run_experiment_6(n_trials=5):
     print(f"Initializing Experiment 6: The Curse of Dimensionality (Noise Injection) - {n_trials} Trials per level...")
     noise_levels = [0,10,50,100]
     n_samples = 5000
     
-    # Store multiple results: final_results[model_name][noise_level] = [acc_trial1, ...]
     final_results = defaultdict(lambda: defaultdict(list))
     
     for noise_val in noise_levels:
@@ -592,7 +591,6 @@ def run_experiment_6(n_trials=5):
             for name in models.keys():
                 final_results[name][noise_val].append(acc_trackers[name].get())
                 
-        # Print average accuracy across trials
         for name in models.keys():
             avg_acc = np.mean(final_results[name][noise_val])
             print(f"{name} Avg Final Acc: {avg_acc:.2%}")
@@ -602,9 +600,8 @@ def run_experiment_6(n_trials=5):
     fig, ax = plt.subplots(figsize=(10, 6))
     
     model_names = list(models.keys())
-    colors = ['blue', '#d4a017', 'green', 'red'] # Base colors for the 4 models
+    colors = ['blue', '#d4a017', 'green', 'red']
     
-    # Offsets and layout settings for grouped boxplots
     step = 0.15 
     width = 0.1
     
@@ -615,13 +612,11 @@ def run_experiment_6(n_trials=5):
         
         data = [final_results[name][n] for n in noise_levels]
         
-        # Plot boxplots
         ax.boxplot(data, positions=positions, widths=width, patch_artist=True,
                    boxprops=dict(facecolor=color, alpha=0.4),
                    medianprops=dict(color=color, linewidth=2),
                    manage_ticks=False)
         
-        # Calculate and connect Medians
         medians = [np.median(d) for d in data]
         ax.plot(positions, medians, color=color, marker='o', linestyle='-', linewidth=2.0, label=name)
 
@@ -667,16 +662,11 @@ def run_experiment_7():
             model.learn_one(x, y)
             results[name]["total_time"] += (time.perf_counter() - start_time)
             
-            # Record resets / drifts
-            if hasattr(model, 'models'):
-                d_count = sum([getattr(bm, "n_drifts_detected", 0) for bm in model.models])
-                if d_count > results[name]["last_drifts"]:
+            d_count = get_total_drifts(model)
+            if d_count > results[name]["last_drifts"]:
+                if not results[name]["drifts"] or (i - results[name]["drifts"][-1]) > 50:
                     results[name]["drifts"].append(i)
-                    results[name]["last_drifts"] = d_count
-            elif hasattr(model, 'n_drifts_detected'):
-                if model.n_drifts_detected > results[name]["last_drifts"]:
-                    results[name]["drifts"].append(i)
-                    results[name]["last_drifts"] = model.n_drifts_detected
+                results[name]["last_drifts"] = d_count
             
             if i % 100 == 0:
                 results[name]["history_rolling"].append(results[name]["Rolling_Acc"].get())
@@ -701,21 +691,21 @@ def run_experiment_7():
 def run_experiment_8():
     print("Initializing Experiment 8: Real-World Benchmarks...\n")
     
-    # 1. Base Datasets
+    N = 15000
+    N = 2**30
+
     benchmark_datasets = [
         ("Phishing Website Detection", datasets.Phishing(), 1250),
-        ("Electricity Pricing", itertools.islice(datasets.Elec2(), 15000), 15000)
+        ("Electricity Pricing", itertools.islice(datasets.Elec2(), N), N)
     ]
     
-    # 2. Forest Covertype (Auto-downloaded globally)
-    covtype_stream = fetch_dynamic_dataset_stream("covtype", 15000)
+    covtype_stream = fetch_dynamic_dataset_stream("covtype", N)
     if covtype_stream:
-        benchmark_datasets.append(("Forest Covertype", covtype_stream, 15000))
+        benchmark_datasets.append(("Forest Covertype", covtype_stream, N))
         
-    # 3. Airlines (Auto-downloaded globally via OpenML)
-    airlines_stream = fetch_dynamic_dataset_stream("airlines", 15000)
+    airlines_stream = fetch_dynamic_dataset_stream("airlines", N)
     if airlines_stream:
-        benchmark_datasets.append(("Airlines (Spatial/Geo)", airlines_stream, 15000))
+        benchmark_datasets.append(("Airlines (Spatial/Geo)", airlines_stream, N))
 
     all_results = {}
     for dataset_name, stream, n_samples in benchmark_datasets:
@@ -736,9 +726,10 @@ def run_experiment_8():
                 model.learn_one(x, y)
                 dataset_results[model_name]["total_time"] += (time.perf_counter() - start_time)
                 
-                d_count = sum([getattr(bm, "n_drifts_detected", 0) for bm in getattr(model, "models", [])])
+                d_count = get_total_drifts(model)
                 if d_count > dataset_results[model_name]["last_drifts"]:
-                    dataset_results[model_name]["drifts"].append(i)
+                    if not dataset_results[model_name]["drifts"] or (i - dataset_results[model_name]["drifts"][-1]) > 50:
+                        dataset_results[model_name]["drifts"].append(i)
                     dataset_results[model_name]["last_drifts"] = d_count
                 
                 if i % (max(1, window_size // 10)) == 0:
@@ -748,7 +739,7 @@ def run_experiment_8():
         all_results[dataset_name] = dataset_results
         print(f"Finished {dataset_name}.\n")
     print("All streams processed. Generating plots and tables...")
-    # Plot per dataset
+    
     for dataset_name, _, n in benchmark_datasets:
         results = all_results[dataset_name]
         window_size = 100 if n < 5000 else 1000
@@ -756,7 +747,7 @@ def run_experiment_8():
         d_dets = {m: results[m]["drifts"] for m in results.keys()}
         plot_time_series(x_axis, {m: results[m]["history_rolling"] for m in results.keys()},
                          title=f"Real-World Data: {dataset_name} (Window={window_size})", drift_detections=d_dets)
-    # Show summary
+    
     data = []
     for dataset_name, _, n_samples in benchmark_datasets:
         results = all_results[dataset_name]
@@ -786,9 +777,10 @@ def run_experiment_9():
                 results[name]["Cumulative_Acc"].update(y, y_pred)
             model.learn_one(x, y)
             
-            d_count = sum([getattr(bm, "n_drifts_detected", 0) for bm in getattr(model, "models", [])])
+            d_count = get_total_drifts(model)
             if d_count > results[name]["last_drifts"]:
-                results[name]["drifts"].append(i)
+                if not results[name]["drifts"] or (i - results[name]["drifts"][-1]) > 50:
+                    results[name]["drifts"].append(i)
                 results[name]["last_drifts"] = d_count
             
             if i % 20 == 0:
@@ -820,15 +812,15 @@ def run_experiment_10():
                 results[name]["Stable_Acc"].update(y, y_pred)
             model.learn_one(x, y)
             
-            d_count = sum([getattr(bm, "n_drifts_detected", 0) for bm in getattr(model, "models", [])])
+            d_count = get_total_drifts(model)
             if d_count > results[name]["last_drifts"]:
-                results[name]["drifts"].append(i)
+                if not results[name]["drifts"] or (i - results[name]["drifts"][-1]) > 50:
+                    results[name]["drifts"].append(i)
                 results[name]["last_drifts"] = d_count
             
             if i % 50 == 0:
                 results[name]["history_stable_acc"].append(results[name]["Stable_Acc"].get())
-                total_drifts = sum([getattr(base_model, "n_drifts_detected", 0) for base_model in getattr(model, "models", [])])
-                results[name]["history_drifts"].append(total_drifts)
+                results[name]["history_drifts"].append(get_total_drifts(model))
         if (i + 1) % 3000 == 0:
             print(f"Processed {i + 1} samples...")
     print("Experiment complete. Generating plots...")

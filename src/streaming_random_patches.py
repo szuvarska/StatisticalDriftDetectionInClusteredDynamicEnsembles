@@ -1057,6 +1057,7 @@ class SRPClassifierADWIN(SRPClassifier):
             drift_det.update(is_error)
 
             if drift_det.drift_detected:
+                self.n_drift_detected += 1
                 self.cluster_drift_detectors[cluster_id] = ADWIN(delta=self.delta)
 
             for model in self.models:
