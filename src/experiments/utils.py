@@ -487,42 +487,75 @@ def run_experiment_5():
     plt.grid(True, linestyle=':', alpha=0.7)
     plt.tight_layout(); plt.show()
 
-def run_experiment_6():
-    print("Initializing Experiment 6: The Curse of Dimensionality (Noise Injection)...")
+def run_experiment_6(n_trials=5):
+    print(f"Initializing Experiment 6: The Curse of Dimensionality (Noise Injection) - {n_trials} Trials per level...")
     noise_levels = [0,10,50,100]
     n_samples = 5000
-    final_results = {"Vanilla SRP": [], "C-DES SRP": [], "C-DES(SDDM)": [], "C-DES(SDDM+ADWIN)": []}
+    
+    # Store multiple results: final_results[model_name][noise_level] = [acc_trial1, ...]
+    final_results = defaultdict(lambda: defaultdict(list))
+    
     for noise_val in noise_levels:
         print(f"\n--- Testing with {noise_val} injected noise features ---")
-        models = make_models(n_models=10, n_clusters=2)
-        acc_trackers = {name: metrics.Accuracy() for name in models.keys()}
-        stream = NoisyAgrawalStream(n_noise_features=noise_val, n_samples=n_samples)
-        for i, (x, y) in enumerate(stream):
-            for name, model in models.items():
-                y_pred = model.predict_one(x)
-                if y_pred is not None:
-                    acc_trackers[name].update(y, y_pred)
-                model.learn_one(x, y)
-            if (i + 1) % 2500 == 0:
-                print(f"Processed {i + 1} samples...")
+        for trial in range(n_trials):
+            seed = 42 + trial
+            models = make_models(n_models=10, n_clusters=2, srp_seed=seed)
+            acc_trackers = {name: metrics.Accuracy() for name in models.keys()}
+            stream = NoisyAgrawalStream(n_noise_features=noise_val, n_samples=n_samples, seed=seed)
+            
+            for i, (x, y) in enumerate(stream):
+                for name, model in models.items():
+                    y_pred = model.predict_one(x)
+                    if y_pred is not None:
+                        acc_trackers[name].update(y, y_pred)
+                    model.learn_one(x, y)
+                    
+            for name in models.keys():
+                final_results[name][noise_val].append(acc_trackers[name].get())
+                
+        # Print average accuracy across trials
         for name in models.keys():
-            final_acc = acc_trackers[name].get()
-            final_results[name].append(final_acc)
-            print(f"{name} Final Acc: {final_acc:.2%}")
-    print("\nExperiment complete. Generating plot...")
-    plt.figure(figsize=(10,6))
-    plt.plot(noise_levels, final_results["Vanilla SRP"], marker='o', markersize=8, linewidth=2.5, label="Vanilla SRP")
-    plt.plot(noise_levels, final_results["C-DES SRP"], marker='X', markersize=8, linewidth=2.5, linestyle='--', color='yellow', label="C-DES SRP")
-    plt.plot(noise_levels, final_results["C-DES(SDDM)"], marker='s', markersize=8, linewidth=2.5, linestyle='-.', color='green', label="C-DES(SDDM)")
-    plt.plot(noise_levels, final_results["C-DES(SDDM+ADWIN)"], marker='D', markersize=8, linewidth=2.5, linestyle=':', color='red', label="C-DES(SDDM+ADWIN)")
-    plt.title("Robustness to Irrelevant Features")
-    plt.xlabel("Number of Injected Noise Features")
-    plt.ylabel("Final Cumulative Accuracy")
-    plt.xticks(noise_levels)
-    plt.ylim(0.4, 1.0)
-    plt.grid(True, linestyle=':', alpha=0.7)
-    plt.legend()
-    plt.tight_layout(); plt.show()
+            avg_acc = np.mean(final_results[name][noise_val])
+            print(f"{name} Avg Final Acc: {avg_acc:.2%}")
+
+    print("\nExperiment complete. Generating grouped boxplots...")
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    model_names = list(models.keys())
+    colors = ['blue', '#d4a017', 'green', 'red'] # Base colors for the 4 models
+    
+    # Offsets and layout settings for grouped boxplots
+    step = 0.15 
+    width = 0.1
+    
+    for m_idx, name in enumerate(model_names):
+        color = colors[m_idx % len(colors)]
+        offset = (m_idx - (len(model_names) - 1) / 2) * step
+        positions = [i + offset for i in range(len(noise_levels))]
+        
+        data = [final_results[name][n] for n in noise_levels]
+        
+        # Plot boxplots
+        ax.boxplot(data, positions=positions, widths=width, patch_artist=True,
+                   boxprops=dict(facecolor=color, alpha=0.4),
+                   medianprops=dict(color=color, linewidth=2),
+                   manage_ticks=False)
+        
+        # Calculate and connect Medians
+        medians = [np.median(d) for d in data]
+        ax.plot(positions, medians, color=color, marker='o', linestyle='-', linewidth=2.0, label=name)
+
+    ax.set_xticks(range(len(noise_levels)))
+    ax.set_xticklabels(noise_levels)
+    ax.set_title("Robustness to Irrelevant Features (Distribution over Multiple Trials)")
+    ax.set_xlabel("Number of Injected Noise Features")
+    ax.set_ylabel("Final Cumulative Accuracy")
+    ax.set_ylim(0.4, 1.0)
+    ax.grid(True, linestyle=':', alpha=0.7)
+    ax.legend(loc="lower left")
+    plt.tight_layout()
+    plt.show()
 
 def run_experiment_7():
     print("Initializing Experiment 7: Standard Synthetic Benchmarks (SEA)...")
