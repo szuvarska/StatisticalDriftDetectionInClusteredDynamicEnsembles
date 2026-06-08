@@ -27,7 +27,7 @@ def make_models(n_models=10, n_clusters=2, drift_delta=1e-5, warn_delta=1e-4,
             seed=srp_seed,
         )
     if include_cdes:
-        models["C-DES SRP"] = CDES_SRP(
+        models["Base C-DES"] = CDES_SRP(
             n_models=n_models,
             n_clusters=n_clusters,
             drift_detector=ADWIN(delta=drift_delta),
@@ -37,7 +37,7 @@ def make_models(n_models=10, n_clusters=2, drift_delta=1e-5, warn_delta=1e-4,
             **extra_cdes_kwargs
         )
     if include_cdes_sddm:
-        models["C-DES(SDDM)"] = CDES_SRP_SDDM(
+        models["C-DES-SDDM"] = CDES_SRP_SDDM(
             n_models=n_models,
             n_clusters=n_clusters,
             drift_detector=ADWIN(delta=drift_delta),
@@ -49,7 +49,7 @@ def make_models(n_models=10, n_clusters=2, drift_delta=1e-5, warn_delta=1e-4,
             **extra_cdes_kwargs
         )
     if include_cdes_sddm_adwin:
-        models["C-DES(SDDM+ADWIN)"] = CDES_SRP_SDDM(
+        models["C-DES-Hybrid"] = CDES_SRP_SDDM(
             n_models=n_models,
             n_clusters=n_clusters,
             drift_detector=ADWIN(delta=drift_delta),
