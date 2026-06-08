@@ -40,10 +40,10 @@ Dependencies: `river`, `numpy`.
 - `notebooks/02_test_c-des_vs_original_srp.ipynb`: Base C-DES vs. Vanilla SRP benchmarks.
 - `notebooks/03_experiments.ipynb`: Recurring concept and number of clusters sensitivity experiments.
 - `notebooks/04_major_vs_minor_drifts.ipynb`: Evaluating SDDM magnitude thresholds and reset strategies.
-- `experiments_v3.ipynb`: Final experiments described thoroughly in the report.
+- `experiments_v3.ipynb`: Final experiments described thoroughly in the [report](report.pdf).
 
 ## 🧪 Usage
-You can use the he C-DES classifiers in a similar way to other River models. Here is a quick example of initializing the C-DES-SDDM configuration:
+You can use the C-DES classifiers in a similar way to other River models. Here is a quick example of initializing the C-DES-SDDM configuration:
 
 ```python
 from src.streaming_random_patches import SRPClassifierSDDM, make_sddm
