@@ -3,6 +3,47 @@ import numpy as np
 from river import base
 
 class RiverSDDM(base.DriftDetector):
+    """
+    Statistical Drift Detection Method (SDDM) for data streams.
+
+    This drift detector monitors incoming data and detects concept drift by comparing 
+    two windows of data: a reference window (representing the historical baseline) and 
+    a current window (representing the latest observations). It maps continuous and 
+    nominal features into histograms and calculates the Kullback-Leibler (KL) divergence 
+    between them. If the divergence exceeds a set threshold, a drift is reported.
+
+    Parameters
+    ----------
+    n_classes : int or None, default=None
+        Number of unique classes in the target variable. If None, the detector attempts 
+        to infer it automatically based on the first data points.
+    n_bins : int, default=20
+        Number of bins used to approximate feature distributions in the histograms. 
+        Higher values yield better resolution but require more data for stability.
+    ref_window_size : int, default=400
+        Size of the reference window. It also defines the length of the initial 
+        warm-up phase used to establish the min/max boundaries for each feature.
+    cur_window_size : int, default=100
+        Size of the current sliding window containing the most recent observations.
+    test_interval : int, default=10
+        Frequency of statistical tests. The algorithm computes KL divergence and 
+        checks for drift only every `test_interval` new samples to optimize performance.
+    threshold : float, default=0.6
+        Fixed sensitivity threshold. If the computed KL divergence for any feature 
+        exceeds this value, a concept drift is triggered.
+    alpha : float, default=1.0
+        Laplace smoothing parameter. Added to the histogram bins to prevent division 
+        by zero and log-of-zero mathematical errors during the KL divergence calculation.
+    min_mag_samples : int, default=50
+        Minimum number of historical drift magnitude samples required to stabilize 
+        the history window statistics (used for dynamic Z-score thresholding).
+    incremental : bool, default=True
+        Reference window update strategy post warm-up. If True, the reference window 
+        grows indefinitely. If False, it operates as a sliding window of fixed size.
+    printer : bool, default=False
+        Diagnostic mode. If True, prints a short report to the console detailing 
+        the step, the source feature, and the magnitude whenever a drift is detected.
+    """
     def __init__(
         self,
         n_classes=None,
